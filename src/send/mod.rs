@@ -307,30 +307,17 @@ fn sort_session_lock_keys(keys: &mut Vec<Jid>) {
     keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
 }
 
-/// The identities a device query for this group's members must ask about.
-///
-/// A LID-addressed group is resolved through the members' phone JIDs wherever
-/// the group knows the mapping: device-list usync is unreliable for LIDs, so
-/// asking under the LID leaves members unresolved and their devices
-/// undiscovered. Shared by the send path's target resolution and by the phash
-/// repair, which would otherwise ask about different identities than the send
-/// it is repairing.
-fn group_device_query_jids(group_info: &wacore::client::context::GroupInfo) -> Vec<Jid> {
-    let is_lid_mode = group_info.addressing_mode == AddressingMode::Lid;
-    group_info
-        .participants
-        .iter()
-        .map(|jid| {
-            if is_lid_mode
-                && jid.is_lid()
-                && let Some(pn) = group_info.phone_jid_for_lid_user(&jid.user)
-            {
-                return pn.to_non_ad();
-            }
-            jid.to_non_ad()
-        })
-        .collect()
-}
+/// How long a group is held after a resync before another mismatch may schedule
+/// one. Long enough that a divergence the refresh cannot settle costs one
+/// participant query rather than one per message; short enough that a real
+/// change minutes later is still repaired well inside the hour a registry entry
+/// would otherwise live.
+#[cfg(not(test))]
+const GROUP_DEVICE_RESYNC_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+/// The resync runs on a detached task, which a test's paused clock does not
+/// reach, so the wait is shortened here rather than driven by `advance`.
+#[cfg(test)]
+const GROUP_DEVICE_RESYNC_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// True when every SKDM target belongs to our own account (PN or LID user).
 /// Own devices are never memoized warm (WA Web's `!isMeDevice` guard on
@@ -1615,7 +1602,19 @@ impl Client {
         };
 
         let is_lid_mode = group_info.addressing_mode == AddressingMode::Lid;
-        let jids_to_resolve = group_device_query_jids(group_info);
+        let jids_to_resolve: Vec<Jid> = group_info
+            .participants
+            .iter()
+            .map(|jid| {
+                if is_lid_mode
+                    && jid.is_lid()
+                    && let Some(pn) = group_info.phone_jid_for_lid_user(&jid.user)
+                {
+                    return pn.to_non_ad();
+                }
+                jid.to_non_ad()
+            })
+            .collect();
 
         let resolved = match freshness {
             crate::cache::Freshness::CachePreferred => {
@@ -1962,43 +1961,65 @@ impl Client {
             });
             let _release = release;
 
-            // `Refresh`, not the cache-preferred read: ordering alone leaves the
-            // window where `invalidate_group_cache` is false, and there the warm
-            // snapshot is exactly the membership the server just disagreed with.
-            let info = match client
-                .groups()
-                .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
-                .await
-            {
-                Ok(info) => info,
-                Err(e) => {
+            // The work in a block of its own: an early return inside it must not
+            // skip the cooldown below, which is what keeps a group that cannot
+            // be repaired from paying a participant query per message.
+            let work = async {
+                // `Refresh`, not the cache-preferred read: ordering alone leaves the
+                // window where `invalidate_group_cache` is false, and there the warm
+                // snapshot is exactly the membership the server just disagreed with.
+                let info = match client
+                    .groups()
+                    .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
+                    .await
+                {
+                    Ok(info) => info,
+                    Err(e) => {
+                        log::warn!(
+                            "phash mismatch for {}: could not read the participant list: {e:?}",
+                            group.observe()
+                        );
+                        return;
+                    }
+                };
+                // The send path's own resolver, with `Refresh`. It maps a mapped LID
+                // to its phone JID (usync is unreliable for LIDs), appends our own
+                // sending identity — a snapshot may omit it, and a companion we just
+                // linked is a device the mismatch can be about — and publishes
+                // through the authoritative path, which keeps the previous snapshot
+                // until the replacement lands and refuses a response a device
+                // notification overtook. Sharing it is also what keeps the repair
+                // asking about the same identities as the send it is repairing.
+                let snapshot = client.persistence_manager.get_device_snapshot();
+                let own_sending = match info.addressing_mode {
+                    AddressingMode::Lid => snapshot.lid.clone(),
+                    AddressingMode::Pn => snapshot.pn.clone(),
+                };
+                let Some(own_sending) = own_sending else {
+                    return;
+                };
+                if let Err(e) = client
+                    .resolve_group_devices_uncached(
+                        &info,
+                        &own_sending,
+                        crate::cache::Freshness::Refresh,
+                    )
+                    .await
+                {
                     log::warn!(
-                        "phash mismatch for {}: could not read the participant list: {e:?}",
+                        "phash mismatch for {}: participant device resync failed: {e:?}",
                         group.observe()
                     );
-                    return;
                 }
             };
-            let targets = group_device_query_jids(&info);
-            if targets.is_empty() {
-                return;
-            }
-            // Invalidate-then-resolve, the pair `schedule_unknown_device_sync`
-            // uses for a contact, rather than the authoritative refresh: that
-            // one demands a complete response, so a single member the server
-            // will not resolve — a number that left WhatsApp, a stale row —
-            // fails the repair for the whole group. Here every list the server
-            // does return is committed, which is what the member with the new
-            // device needs.
-            for target in &targets {
-                client.invalidate_device_cache(&target.user).await;
-            }
-            if let Err(e) = client.get_user_devices_owned(targets).await {
-                log::warn!(
-                    "phash mismatch for {}: participant device resync failed: {e:?}",
-                    group.observe()
-                );
-            }
+            work.await;
+
+            // Hold the mark past the work. The set alone dedups only what
+            // overlaps a resync in flight, and sequential sends arrive after it:
+            // a divergence the refresh cannot settle — a rejected or rate-limited
+            // usync, a server that keeps disagreeing — would otherwise pay a full
+            // participant query per message, the cost this arm exists to avoid.
+            client.runtime.sleep(GROUP_DEVICE_RESYNC_COOLDOWN).await;
         }));
     }
 
@@ -3328,6 +3349,33 @@ mod tests {
             !client.pending_group_device_resync.add(&group),
             "a second mismatch must leave the in-flight mark standing, not clear it"
         );
+    }
+
+    /// Both halves of the mark's life. It has to outlive the work — the set
+    /// alone dedups what overlaps a resync in flight, and sequential sends
+    /// arrive after it, so a divergence the refresh cannot settle would pay a
+    /// participant query per message. And it has to clear afterwards: the guard
+    /// runs on drop, so the outcome does not decide whether it fires, but if a
+    /// refactor drops it, every later mismatch for that group is deduplicated
+    /// away forever while the seeded-mark test above still passes.
+    #[tokio::test]
+    async fn a_group_resync_holds_its_mark_through_the_cooldown_then_clears_it() {
+        let client = crate::test_utils::create_test_client().await;
+        let group: Jid = "120363000000000003@g.us".parse().unwrap();
+
+        client.resync_group_participant_devices(&group).await;
+        // No socket here, so the work ends at once: what holds the mark now is
+        // the cooldown, not a query still running.
+        tokio::task::yield_now().await;
+        assert!(
+            !client.pending_group_device_resync.add(&group),
+            "the mark must stand through the cooldown"
+        );
+
+        crate::test_utils::poll_until("the cooldown to release the mark", || {
+            client.pending_group_device_resync.add(&group)
+        })
+        .await;
     }
 
     /// The two queues are separate on purpose: the offline drain resolves every
@@ -4829,57 +4877,6 @@ mod tests {
             "the device query must cover the member the server just returned: {asked:?}"
         );
         handler.await.expect("the handler completes");
-    }
-
-    /// The release side of the scopeguard. If it ever stops firing — a
-    /// refactor drops the guard, an edit returns before it is built — every
-    /// later mismatch for that group is deduplicated away forever, and the
-    /// dedup test above still passes because it seeds the mark by hand. The
-    /// guard runs on drop, so the outcome the task reaches does not change
-    /// whether it fires: this client has no socket, the participant query
-    /// fails at once, and the mark still has to clear.
-    #[tokio::test]
-    async fn a_finished_group_resync_releases_its_mark() {
-        let client = crate::test_utils::create_test_client().await;
-        let group: Jid = "120363000000000003@g.us".parse().unwrap();
-
-        client.resync_group_participant_devices(&group).await;
-
-        crate::test_utils::poll_until("the resync to release its mark", || {
-            client.pending_group_device_resync.add(&group)
-        })
-        .await;
-    }
-
-    /// A LID group's device query goes out under the members' phone JIDs: usync
-    /// is unreliable for LIDs, so asking under the LID leaves the member
-    /// unresolved and the device that caused the mismatch undiscovered. The
-    /// send path resolves this way already; the repair reads the same helper so
-    /// the two cannot ask about different identities.
-    #[test]
-    fn a_lid_group_is_queried_by_the_members_phone_jids() {
-        use std::collections::HashMap;
-        use wacore::client::context::GroupInfo;
-
-        let lid: Jid = "20000000000010@lid".parse().unwrap();
-        let pn: Jid = "5511000000010@s.whatsapp.net".parse().unwrap();
-        let unmapped: Jid = "20000000000011@lid".parse().unwrap();
-        let mut map = HashMap::new();
-        map.insert(lid.user.clone(), pn.clone());
-
-        let info = GroupInfo::with_lid_to_pn_map(
-            vec![lid.clone(), unmapped.clone()],
-            AddressingMode::Lid,
-            map,
-        );
-
-        let asked = group_device_query_jids(&info);
-        assert_eq!(
-            asked,
-            vec![pn, unmapped],
-            "a mapped LID is asked about by its phone JID; one the group cannot map \
-             is left as it is, which is what the send path does"
-        );
     }
 
     /// The other half, and the reason the repair cannot storm: the members that
