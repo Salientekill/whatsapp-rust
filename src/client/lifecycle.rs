@@ -573,6 +573,8 @@ impl Client {
 
             pending_device_sync: crate::pending_device_sync::PendingDeviceSync::new(),
 
+            pending_group_device_resync: crate::pending_device_sync::PendingDeviceSync::new(),
+
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
             pending_lid_refreshes: Arc::new(std::sync::Mutex::new(HashSet::new())),

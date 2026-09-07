@@ -1861,11 +1861,10 @@ impl Client {
             }
         }
         let jid_str = jid.to_string();
-        // A group takes neither arm: `resendGroupMsg` answers a mismatch with
-        // `sendQueryGroup` alone, which is the metadata invalidation below.
-        // Forgetting its sender keys, or its device rows, would cost a full
-        // fan-out or a full re-resolve on every message while the divergence
-        // lasts.
+        // A group forgets neither its sender keys nor its device rows here:
+        // either would cost a full fan-out or a full re-resolve on every message
+        // while the divergence lasts. What it does do is ask the server for the
+        // members' device lists once — see `resync_group_participant_devices`.
         let mut flush_fallback = false;
         if jid.is_status_broadcast() {
             let distribution_guard = self.group_distribution_lock(jid).await;
@@ -1887,6 +1886,8 @@ impl Client {
             drop(distribution_guard);
         } else if !jid.is_group() {
             self.sender_key_device_cache.invalidate(&jid_str).await;
+        } else {
+            self.resync_group_participant_devices(jid).await;
         }
         if flush_fallback {
             let _ = self
@@ -1901,6 +1902,67 @@ impl Client {
         if let Some(resend) = resend {
             self.resend_dm_to_uncovered_devices(jid, resend).await;
         }
+    }
+
+    /// Ask the server for the group members' device lists after it told us ours
+    /// disagrees with its own.
+    ///
+    /// The group arm of a `phash` mismatch used to stop at the metadata
+    /// invalidation, which re-reads the participant list and nothing else. A
+    /// device is not a participant: when the divergence is a companion linked, a
+    /// phone restored or an app reinstalled — the notification for which can be
+    /// missed while the client is offline — the member set is unchanged and every
+    /// subsequent send resolves the same cached devices. The new device is then
+    /// outside the resolved set, so it is never an SKDM target and cannot decrypt
+    /// anything the group sends. Nothing shortens that: the registry entry lives
+    /// an hour, and the only other repair is a retry receipt from the device
+    /// itself, which arrives when its owner happens to interact with a message
+    /// they cannot read.
+    ///
+    /// So the mismatch — the one signal the server gives us — refreshes the
+    /// members' device lists. One usync for the whole participant list, in the
+    /// background, deduplicated per group: a divergence spanning several sends
+    /// asks once, not once per message, which is the cost the metadata-only arm
+    /// was avoiding.
+    async fn resync_group_participant_devices(self: &std::sync::Arc<Self>, group: &Jid) {
+        if !self.pending_group_device_resync.add(group) {
+            return;
+        }
+        let client = std::sync::Arc::clone(self);
+        let group = group.clone();
+        self.runtime.spawn_detached(Box::pin(async move {
+            // A guard, not a trailing call: the query can fail or be cancelled
+            // with the runtime, and the dedup must not outlive the work.
+            let release = scopeguard::guard((), {
+                let client = std::sync::Arc::clone(&client);
+                let group = group.clone();
+                move |()| client.pending_group_device_resync.remove(&group)
+            });
+            let _release = release;
+
+            let info = match client.groups().query_info(&group).await {
+                Ok(info) => info,
+                Err(e) => {
+                    log::warn!(
+                        "phash mismatch for {}: could not read the participant list: {e:?}",
+                        group.observe()
+                    );
+                    return;
+                }
+            };
+            if info.participants.is_empty() {
+                return;
+            }
+            if let Err(e) = client
+                .refresh_user_devices(info.participants.to_vec())
+                .await
+            {
+                log::warn!(
+                    "phash mismatch for {}: participant device resync failed: {e:?}",
+                    group.observe()
+                );
+            }
+        }));
     }
 
     /// Deliver a DM to the devices a refreshed list holds and the sent stanza
@@ -3210,6 +3272,41 @@ mod tests {
         assert!(!Arc::ptr_eq(&without_self, &out));
         assert_eq!(out.participants.len(), 2);
         assert!(out.participants.iter().any(|p| p.is_same_user_as(&own)));
+    }
+
+    /// The resync exists to run once per divergence, not once per message: a
+    /// group whose phash keeps disagreeing would otherwise ask the server for
+    /// every member's device list on every send.
+    #[tokio::test]
+    async fn a_group_device_resync_in_flight_is_not_scheduled_again() {
+        let client = crate::test_utils::create_test_client().await;
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+
+        assert!(
+            client.pending_group_device_resync.add(&group),
+            "the first mark is the one in flight"
+        );
+        client.resync_group_participant_devices(&group).await;
+        assert!(
+            !client.pending_group_device_resync.add(&group),
+            "a second mismatch must leave the in-flight mark standing, not clear it"
+        );
+    }
+
+    /// The two queues are separate on purpose: the offline drain resolves every
+    /// entry of `pending_device_sync` with a usync for a contact, and a group
+    /// JID there would be queried as if it were one.
+    #[tokio::test]
+    async fn a_group_resync_never_enters_the_contact_sync_queue() {
+        let client = crate::test_utils::create_test_client().await;
+        let group: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        client.resync_group_participant_devices(&group).await;
+
+        assert!(
+            client.pending_device_sync.take_all().is_empty(),
+            "the contact queue must stay empty when a group is resynced"
+        );
     }
 
     // The group SKDM pairwise fan-out must hold the SAME per-device session mutex

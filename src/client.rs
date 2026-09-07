@@ -1619,6 +1619,12 @@ pub struct Client {
     pub(crate) sender_key_device_cache: crate::sender_key_device_cache::SenderKeyDeviceCache,
 
     pub(crate) pending_device_sync: crate::pending_device_sync::PendingDeviceSync,
+    /// Groups with a participant-device resync in flight, so a divergence that
+    /// spans several sends asks the server once instead of once per message.
+    /// Separate from `pending_device_sync`, whose entries are users the offline
+    /// drain resolves with a usync — a group JID there would be queried as if it
+    /// were a contact.
+    pub(crate) pending_group_device_resync: crate::pending_device_sync::PendingDeviceSync,
 
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
 
