@@ -817,6 +817,37 @@ impl<'a> Groups<'a> {
                         // check and the decision below.
                         let metadata = self.client.lock_group_metadata(jid).await;
                         if let Some(current) = metadata.current().await {
+                            // A warm snapshot can predate mappings learned since
+                            // it was published; enrich a copy rather than serve
+                            // stale LIDs to the device query.
+                            let missing = current.addressing_mode == AddressingMode::Lid
+                                && current.participants.iter().any(|participant| {
+                                    participant.is_lid()
+                                        && current
+                                            .phone_jid_for_lid_user(&participant.user)
+                                            .is_none()
+                                });
+                            if missing {
+                                let mut enriched = (*current).clone();
+                                self.fill_group_info_pns(&mut enriched).await;
+                                let learned = enriched.participants.iter().any(|participant| {
+                                    participant.is_lid()
+                                        && current
+                                            .phone_jid_for_lid_user(&participant.user)
+                                            .is_none()
+                                        && enriched
+                                            .phone_jid_for_lid_user(&participant.user)
+                                            .is_some()
+                                });
+                                // Publish only on actual learning: publish
+                                // rewrites the durable blob, which a plain
+                                // warm hit must not pay for.
+                                if learned {
+                                    let enriched = Arc::new(enriched);
+                                    metadata.publish(Arc::clone(&enriched)).await;
+                                    return Ok(enriched);
+                                }
+                            }
                             return Ok(current);
                         }
 
@@ -2383,6 +2414,58 @@ mod tests {
             &client.groups().query_info(&group).await.unwrap()
         ));
         assert_eq!(transport.sent().len(), 1);
+    }
+
+    /// A warm snapshot can predate mappings learned since it was published.
+    /// A Refresh that the server answers with not-modified must enrich its
+    /// copy from the mapping cache rather than serve stale LIDs.
+    #[tokio::test]
+    async fn query_info_not_modified_enriches_warm_snapshot() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+        let participants = vec![Jid::lid("100000000000101"), Jid::lid("100000000000102")];
+        client
+            .get_group_cache()
+            .insert(
+                group.clone(),
+                Arc::new(GroupInfo::new(participants.clone(), AddressingMode::Lid)),
+            )
+            .await;
+        // Learned after the snapshot was published, e.g. from an inbound
+        // message carrying both identifiers.
+        client
+            .lid_pn_cache
+            .add(&LidPnEntry::new(
+                participants[0].user.to_string(),
+                "15555550101",
+                LearningSource::Usync,
+            ))
+            .await;
+        let query = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move {
+                client
+                    .groups()
+                    .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
+                    .await
+            })
+        };
+        let id = pending_group_query(&transport, 0).await;
+        crate::test_utils::answer_iq(&client, &id, &iq_result(&id, &group)).await;
+        let info = query.await.unwrap().unwrap();
+        assert_eq!(
+            info.phone_jid_for_lid_user(&participants[0].user),
+            Some(&Jid::pn("15555550101")),
+            "the warm snapshot must gain the mapping learned since it was cached"
+        );
+        assert!(info.phone_jid_for_lid_user(&participants[1].user).is_none());
+        assert!(Arc::ptr_eq(
+            &info,
+            &client.groups().query_info(&group).await.unwrap()
+        ));
     }
 
     #[tokio::test]

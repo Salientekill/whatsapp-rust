@@ -505,18 +505,42 @@ impl Client {
             });
         }
 
-        // All strict validation has completed. Apply identity cleanup before
-        // publishing replacement snapshots so no send can pair a new registry
-        // record with sessions established under the previous identity.
+        // Publish replacements before destructive cleanup: if the backend
+        // write fails, sender-key rows and sessions are still intact and a
+        // retry recomputes the same removals. Everything here runs under the
+        // mapping and registry guards, so no send observes the intermediate
+        // state.
+        //
+        // One batched backend write for the whole usync response — for
+        // large groups this collapses N spawn_blocking SQLite hops into
+        // a single transaction, which dominated the per-send wall-clock.
+        self.update_device_lists_guarded(device_records, guard)
+            .await?;
         for (user, device_id) in pending_removals {
-            self.delete_sender_key_rows_for_device(&user.user, device_id)
-                .await?;
+            if let Err(e) = self
+                .delete_sender_key_rows_for_device(&user.user, device_id)
+                .await
+            {
+                // The replacement records are already durable; bias the live
+                // cache toward redistribution so a removed-then-readded device
+                // cannot ride a stale warm mark past the SKDM it needs.
+                self.sender_key_device_cache
+                    .invalidate_entries_for_device(&user.user, device_id)
+                    .await;
+                return Err(e.into());
+            }
         }
         for reset in pending_identity_resets {
             for device in &reset.previous.devices {
-                if device.device_id() != 0 {
-                    self.delete_sender_key_rows_for_device(&reset.user.user, device.device_id())
-                        .await?;
+                if device.device_id() != 0
+                    && let Err(e) = self
+                        .delete_sender_key_rows_for_device(&reset.user.user, device.device_id())
+                        .await
+                {
+                    self.sender_key_device_cache
+                        .invalidate_entries_for_device(&reset.user.user, device.device_id())
+                        .await;
+                    return Err(e.into());
                 }
             }
             self.clear_device_record(
@@ -530,12 +554,6 @@ impl Client {
                     .await;
             }
         }
-
-        // One batched backend write for the whole usync response — for
-        // large groups this collapses N spawn_blocking SQLite hops into
-        // a single transaction, which dominated the per-send wall-clock.
-        self.update_device_lists_guarded(device_records, guard)
-            .await?;
 
         Ok(fetched_devices)
     }
@@ -1057,6 +1075,88 @@ mod tests {
             );
             assert_eq!(map.device_has_key(&user.user, 0), Some(true));
         }
+    }
+
+    /// A failed registry write must not leave sender-key rows and sessions
+    /// deleted for a device list that never landed: the cleanup runs after
+    /// the write, so a write that never happened leaves everything intact.
+    #[tokio::test]
+    async fn group_refresh_write_failure_keeps_tracking_and_sessions() {
+        use std::sync::atomic::Ordering;
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let user = Jid::pn("12025550129");
+        let group = "120363000000000129@g.us";
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
+                timestamp: 1,
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+        let rows = [
+            (user.to_string(), true),
+            (user.with_device(7).to_string(), true),
+        ];
+        client
+            .persistence_manager
+            .set_sender_key_status(
+                group,
+                &[(rows[0].0.as_str(), true), (rows[1].0.as_str(), true)],
+            )
+            .await
+            .unwrap();
+        let session = seed_fresh_session(&client, &user.with_device(7)).await;
+        // The replacement drops device 7, so the old order would delete its
+        // sender-key rows and session before attempting the write.
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: None,
+                key_index_bytes: None,
+            }],
+            lid_mappings: Vec::new(),
+        };
+        client
+            .fail_next_device_list_write
+            .store(true, Ordering::SeqCst);
+        client
+            .try_process_group_device_list_response(
+                &response,
+                std::slice::from_ref(&user),
+                client.device_topology.current(),
+            )
+            .await
+            .expect_err("the injected write failure must surface");
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|(jid, has_key)| jid == &user.with_device(7).to_string() && *has_key),
+            "a write that never happened must not delete sender-key tracking: {rows:?}"
+        );
+        assert!(
+            has_session(&client, &session).await,
+            "a write that never happened must not delete sessions"
+        );
+        assert!(
+            client
+                .load_device_record_for_jid(&user)
+                .await
+                .unwrap()
+                .devices
+                .iter()
+                .any(|device| device.device_id() == 7),
+            "the previous device list must survive a failed write"
+        );
     }
 
     #[tokio::test]

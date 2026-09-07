@@ -104,7 +104,11 @@ impl IdentityContinuity {
             if state.users.len() == IDENTITY_CHANGE_CAPACITY
                 && let Some((evicted, _)) = state.users.pop_front()
             {
-                state.floor = evicted;
+                // The evicted mutation is no longer examined, so the floor
+                // must move past its generation: a snapshot stamped exactly
+                // there can no longer prove that mutation left its accounts
+                // untouched.
+                state.floor = evicted.saturating_add(1);
             }
             state.users.push_back((generation, user_fingerprint(user)));
         }
@@ -7733,6 +7737,22 @@ mod identity_continuity_tests {
             IDENTITY_CHANGE_CAPACITY
         );
         assert!(continuity.unchanged_for(continuity.snapshot(), ["unrelated"]));
+    }
+
+    #[test]
+    fn evicted_generation_snapshots_cannot_authorize_replacement() {
+        let continuity = IdentityContinuity::default();
+        drop(continuity.changing(["replaced"]));
+        let stamped = continuity.snapshot();
+        assert_eq!(stamped, Some(1));
+        for _ in 0..IDENTITY_CHANGE_CAPACITY {
+            drop(continuity.changing(["other"]));
+        }
+        // The mutation that replaced the account is gone from the journal;
+        // the stale snapshot must not clear that account or anything else.
+        assert!(!continuity.unchanged_for(stamped, ["replaced"]));
+        assert!(!continuity.unchanged_for(stamped, ["other"]));
+        assert!(continuity.unchanged_for(continuity.snapshot(), ["other"]));
     }
 
     #[test]

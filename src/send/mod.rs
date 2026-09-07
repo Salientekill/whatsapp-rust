@@ -313,6 +313,10 @@ fn sort_session_lock_keys(keys: &mut Vec<Jid>) {
 
 /// Bounds repeated refreshes when the server keeps rejecting the same device set.
 const GROUP_DEVICE_RESYNC_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+/// Short backoff after a failed refresh (network error, retired connection):
+/// the next mismatch is likely legitimate, so it must not wait out the full
+/// cooldown, which exists for a divergence the refresh could not settle.
+const GROUP_DEVICE_RESYNC_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn group_distribution_targets(devices: &wacore::send::ResolvedGroupDevices, own: &Jid) -> Vec<Jid> {
     let mut targets = devices.devices().to_vec();
@@ -4901,6 +4905,229 @@ mod tests {
             "the device query must cover the member the server just returned: {asked:?}"
         );
         handler.await.expect("the handler completes");
+    }
+
+    /// In a LID group the delta must resolve through the refreshed
+    /// membership's maps: a bare participant list has an empty map, so LID
+    /// members would be queried by raw LID while PN-keyed answers could not
+    /// convert back, and the namespace mismatch would empty the delta.
+    ///
+    /// The mocked usync answers like the real server: phone queries get the
+    /// device list, LID queries get an error. A repair that asks by LID
+    /// therefore resolves nothing and emits nothing.
+    #[tokio::test]
+    async fn a_lid_group_repair_finds_a_missed_device_through_the_maps() {
+        use buffa::Message as _;
+        use std::collections::HashMap;
+        use wacore::client::context::GroupInfo;
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore_binary::builder::NodeBuilder;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetAccount(Some(peer_test_account_proto())))
+            .await;
+        let own: Jid = "5511000000001@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000001@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(own.clone())))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(own_lid.clone())))
+            .await;
+        let member: Jid = "20000000000010@lid".parse().unwrap();
+        let member_pn: Jid = "5511000000010@s.whatsapp.net".parse().unwrap();
+        let group: Jid = "120363000000000042@g.us".parse().unwrap();
+        client
+            .get_group_cache()
+            .insert(
+                group.clone(),
+                Arc::new(GroupInfo::with_lid_to_pn_map(
+                    vec![member.clone()],
+                    AddressingMode::Lid,
+                    HashMap::from([(member.user.clone(), member_pn.clone())]),
+                )),
+            )
+            .await;
+        client
+            .device_registry_cache
+            .raw_insert_for_tests(
+                Arc::from(member_pn.user.as_str()),
+                Arc::new(DeviceListRecord {
+                    user: member_pn.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None)].into(),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                }),
+            )
+            .await;
+        // Our own record under the LID key, so neither the send nor the
+        // repair spends a usync on ourselves; the member is the only miss.
+        client
+            .device_registry_cache
+            .raw_insert_for_tests(
+                Arc::from(own_lid.user.as_str()),
+                Arc::new(DeviceListRecord {
+                    user: own_lid.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None)].into(),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                }),
+            )
+            .await;
+        crate::test_utils::seed_peer_session(&client, &member.with_device(0)).await;
+        client
+            .send_message_with_options(
+                group.clone(),
+                wa::Message::text("hi"),
+                SendOptions::default().with_message_id("LIDREPAIR1"),
+            )
+            .await
+            .expect("group text send should reach the wire");
+        let Some(crate::client::ResponseWaiter::GroupPhash(_, snapshot)) =
+            client.response_waiters_guard().remove("LIDREPAIR1")
+        else {
+            panic!("group waiter missing");
+        };
+        // The divergence: the member linked a companion the registry never
+        // saw, and the registry itself is empty again, so the repair must go
+        // back to the wire for it.
+        let mut missed = member.clone();
+        missed.device = 2;
+        crate::test_utils::seed_peer_session(&client, &missed).await;
+        let guard = client.device_topology.lock_registry().await;
+        client
+            .device_registry_cache
+            .invalidate(&guard, member_pn.user.as_str())
+            .await;
+        drop(guard);
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let refresh = client
+            .pending_group_device_resync
+            .refresh(generation, &group);
+        *refresh.lock().await = Some(true);
+        let before = transport.sent_count();
+        let repair = tokio::spawn({
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            async move {
+                client
+                    .repair_group_message(&group, "LIDREPAIR1", snapshot, generation)
+                    .await
+            }
+        });
+        // Answer the repair's usync the way the server would: PN queries get
+        // the new companion, LID queries fail.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut answered = false;
+        while !answered {
+            for index in before..transport.sent_count() {
+                let owned = crate::test_utils::decode_sent_iq(&transport, index).await;
+                let frame = owned.get();
+                if frame.attrs().optional_string("xmlns").as_deref() != Some("usync") {
+                    continue;
+                }
+                let id = frame.attrs().optional_string("id").unwrap().to_string();
+                let asked: Vec<Jid> = frame
+                    .get_optional_child("usync")
+                    .and_then(|usync| usync.get_optional_child("list"))
+                    .into_iter()
+                    .flat_map(|list| list.children().into_iter().flatten())
+                    .filter_map(|user| user.attrs().optional_jid("jid"))
+                    .collect();
+                assert!(
+                    !asked.is_empty(),
+                    "the repair must ask about the member: {asked:?}"
+                );
+                // Companions without a signed key-index-list are dropped, so
+                // the answer carries one with device 2 valid.
+                let index = wa::ADVKeyIndexList {
+                    raw_id: Some(1),
+                    timestamp: Some(1000),
+                    current_index: Some(2),
+                    valid_indexes: vec![0, 2],
+                    ..Default::default()
+                };
+                let signed = wa::ADVSignedKeyIndexList {
+                    details: Some(index.encode_to_vec()),
+                    ..Default::default()
+                };
+                let answer = NodeBuilder::new("iq")
+                    .attr("type", "result")
+                    .attr("id", id.clone())
+                    .children([NodeBuilder::new("usync")
+                        .children([NodeBuilder::new("list")
+                            .children(asked.iter().map(|asked| {
+                                let user = NodeBuilder::new("user").attr("jid", asked);
+                                if asked.is_lid() {
+                                    user.children([NodeBuilder::new("devices")
+                                        .children([NodeBuilder::new("error")
+                                            .attr("code", "500")
+                                            .build()])
+                                        .build()])
+                                        .build()
+                                } else {
+                                    user.children([NodeBuilder::new("devices")
+                                        .children([
+                                            NodeBuilder::new("device-list")
+                                                .children([
+                                                    NodeBuilder::new("device")
+                                                        .attr("id", "0")
+                                                        .build(),
+                                                    NodeBuilder::new("device")
+                                                        .attr("id", "2")
+                                                        .attr("key-index", "2")
+                                                        .build(),
+                                                ])
+                                                .build(),
+                                            NodeBuilder::new("key-index-list")
+                                                .attr("ts", "1000")
+                                                .bytes(signed.encode_to_vec())
+                                                .build(),
+                                        ])
+                                        .build()])
+                                        .build()
+                                }
+                            }))
+                            .build()])
+                        .build()])
+                    .build();
+                crate::test_utils::answer_iq(&client, &id, &answer).await;
+                answered = true;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("the repair never reached a device query");
+            }
+            tokio::task::yield_now().await;
+        }
+        repair.await.expect("repair task").expect("the repair runs");
+        assert_eq!(
+            transport.sent_count(),
+            before + 2,
+            "a missed LID companion must produce exactly one device query and one direct repair"
+        );
+        let owned = crate::test_utils::decode_sent_iq(&transport, before + 1).await;
+        let node = owned.get();
+        let participants = node.get_optional_child("participants").unwrap();
+        let targets: Vec<_> = participants
+            .children()
+            .unwrap()
+            .iter()
+            .map(|child| child.attrs().optional_jid("jid").unwrap())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![missed.clone()],
+            "the delta keeps the original LID namespace: {targets:?}"
+        );
     }
 
     /// The other half, and the reason the repair cannot storm: the members that

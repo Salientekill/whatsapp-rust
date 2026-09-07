@@ -575,6 +575,9 @@ impl Client {
 
             pending_group_device_resync: crate::send::group_repair::GroupRepair::new(),
 
+            #[cfg(test)]
+            fail_next_device_list_write: AtomicBool::new(false),
+
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
             pending_lid_refreshes: Arc::new(std::sync::Mutex::new(HashSet::new())),

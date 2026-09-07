@@ -305,7 +305,12 @@ impl Client {
             };
             *result = Some(success);
             drop(result);
-            let sleep = client.runtime.sleep(super::GROUP_DEVICE_RESYNC_COOLDOWN);
+            let cooldown = if success {
+                super::GROUP_DEVICE_RESYNC_COOLDOWN
+            } else {
+                super::GROUP_DEVICE_RESYNC_RETRY_COOLDOWN
+            };
+            let sleep = client.runtime.sleep(cooldown);
             let cancelled = wacore::runtime::wait_for_shutdown(&shutdown);
             futures::pin_mut!(sleep, cancelled);
             let _ = futures::future::select(cancelled, sleep).await;
@@ -336,7 +341,10 @@ impl Client {
             .as_ref()
             .ok_or(crate::client::ClientError::NotLoggedIn)?;
         let addressed = sent.devices;
-        // Membership refresh must not add recipients to a message already sent.
+        // Membership refresh must not add recipients to a message already
+        // sent, but the resolve must keep the refreshed LID→PN maps: a bare
+        // GroupInfo has an empty map, so LID members would be queried by raw
+        // LID and PN-keyed answers could not convert back, emptying the delta.
         let users: std::collections::HashSet<_> =
             addressed.devices().iter().map(Jid::to_non_ad).collect();
         let mode = sent.addressing_mode;
@@ -347,7 +355,18 @@ impl Client {
                 .ok_or(crate::client::ClientError::NotLoggedIn)?,
             AddressingMode::Pn => own_pn,
         };
-        let old_group = wacore::client::context::GroupInfo::new(users.into_iter().collect(), mode);
+        // The refresh above just published, so this is a cache hit for the
+        // membership the server returned, maps included.
+        let fresh_info = self.groups().query_info(group).await?;
+        let mut old_group = (*fresh_info).clone();
+        let departed: Vec<wacore_binary::CompactString> = old_group
+            .participants
+            .iter()
+            .filter(|participant| !users.iter().any(|user| user.user == participant.user))
+            .map(|participant| participant.user.clone())
+            .collect();
+        let departed: Vec<&str> = departed.iter().map(|user| user.as_str()).collect();
+        old_group.remove_participants(&departed);
         let fresh = self
             .resolve_group_devices_uncached(&old_group, own, Freshness::CachePreferred)
             .await?;
@@ -931,16 +950,25 @@ mod tests {
         assert_eq!(*first.lock().await, Some(true));
     }
 
+    /// A failed refresh must not hold the full divergence cooldown: the next
+    /// mismatch after a network blip is likely legitimate. Advancing past
+    /// the retry backoff releases the mark while the full cooldown still has
+    /// almost its whole duration left, which is what distinguishes the two.
     #[tokio::test(start_paused = true)]
-    async fn cooldown_uses_the_runtime_clock() {
+    async fn failed_refresh_uses_the_short_backoff() {
         let client = crate::test_utils::create_test_client().await;
         let group = "120363000000000001@g.us".parse().unwrap();
         assert!(!client.refresh_group_for_repair(&group, 0).await);
-        tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(59)).await;
-        assert_eq!(client.pending_group_device_resync.len(), 1);
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(
+            super::super::GROUP_DEVICE_RESYNC_RETRY_COOLDOWN + std::time::Duration::from_secs(1),
+        )
+        .await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(client.pending_group_device_resync.len(), 0);
     }
 

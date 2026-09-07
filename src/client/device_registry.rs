@@ -831,6 +831,17 @@ impl Client {
     ) -> Result<()> {
         use anyhow::Context;
 
+        // Test-only fault hook (see `Client::fail_next_device_list_write`):
+        // fail before touching cache or backend so the caller observes a
+        // write that never happened.
+        #[cfg(test)]
+        if self
+            .fail_next_device_list_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected device-list write failure");
+        }
+
         if records.is_empty() {
             return Ok(());
         }

@@ -1652,6 +1652,12 @@ pub struct Client {
     /// were a contact.
     pub(crate) pending_group_device_resync: crate::send::group_repair::GroupRepair,
 
+    /// Test-only fault hook: fail the next batched device-list write so a
+    /// regression test can prove destructive cleanup never runs before the
+    /// replacement records are durable. Never set outside tests.
+    #[cfg(test)]
+    pub(crate) fail_next_device_list_write: AtomicBool,
+
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
 
     /// Identities with a `refresh_lid` re-resolve in flight, keyed by
