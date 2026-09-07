@@ -3710,6 +3710,26 @@ impl ProtocolStore for SqliteStore {
         .await
     }
 
+    async fn get_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
+        let chat_jid = chat_jid.to_string();
+        let message_id = message_id.to_string();
+        let device_id = self.device_id;
+        self.with_read_retry("get_sent_message", || {
+            let chat_jid = chat_jid.clone();
+            let message_id = message_id.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                sent_messages::table
+                    .select(sent_messages::payload)
+                    .filter(sent_messages::chat_jid.eq(&chat_jid))
+                    .filter(sent_messages::message_id.eq(&message_id))
+                    .filter(sent_messages::device_id.eq(device_id))
+                    .first(conn)
+                    .optional()
+            })
+        })
+        .await
+    }
+
     async fn take_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
         let chat_jid = chat_jid.to_string();
         let message_id = message_id.to_string();
@@ -4350,6 +4370,66 @@ mod tests {
         SqliteStore::new(&db_name)
             .await
             .expect("Failed to create test store")
+    }
+
+    #[tokio::test]
+    async fn get_sent_message_preserves_payload_expiry_and_device_scope() {
+        let store = create_test_store().await;
+        let chat = "120363000000000001@g.us";
+        store
+            .store_sent_message(chat, "READ", b"payload")
+            .await
+            .unwrap();
+        store
+            .write_blocking(|conn| {
+                diesel::update(sent_messages::table)
+                    .set(sent_messages::created_at.eq(1_i64))
+                    .execute(conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                store
+                    .get_sent_message(chat, "READ")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(b"payload".as_slice())
+            );
+        }
+        assert!(
+            store
+                .get_sent_message(chat, "MISSING")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_sent_message("120363000000000002@g.us", "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .share_for_device(store.device_id + 1)
+                .get_sent_message(chat, "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.delete_expired_sent_messages(2).await.unwrap(), 1);
+        assert!(
+            store
+                .get_sent_message(chat, "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The legacy-spelling normalisation, run against the migration file itself
@@ -7063,7 +7143,7 @@ mod read_routing_tests {
         assert_eq!(got.as_deref(), Some(&b"blob"[..]));
     }
 
-    /// Ensures a write-queue read completes while a write burst holds the permit.
+    /// A queued burst and read must both progress once the writer releases them.
     #[tokio::test]
     async fn write_queue_read_completes_beside_a_held_burst() {
         use std::future::{Future, poll_fn};
@@ -7072,23 +7152,61 @@ mod read_routing_tests {
 
         let db = TempDb::new("held_burst");
         let store = store_with(1, &db).await;
+        assert_eq!(store.pool.max_size(), 1);
         let rows = vec![AppStateMutationMAC {
             index_mac: vec![0xA1; 32],
             value_mac: vec![0xC5; 32],
         }];
 
         let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let writer = {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .write_blocking(move |_conn| {
+                            entered_tx.send(()).expect("test awaits the writer");
+                            release_rx
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("test releases the writer gate");
+                            Ok(())
+                        })
+                        .await
+                })
+            };
+            entered_rx
+                .await
+                .expect("writer holds the connection and permit");
+
             let mut burst = pin!(store.put_mutation_macs("regular", 1, &rows));
-            let finished = poll_fn(|cx| Poll::Ready(burst.as_mut().poll(cx).is_ready())).await;
-            assert!(!finished, "the burst finished before the read was issued");
-            let (read, _) = tokio::join!(store.get_devices("190455501800"), async {
-                burst.await.expect("write burst")
-            });
+            let mut read = pin!(store.get_devices("15550000001"));
+            poll_fn(|cx| {
+                // The gate, not SQL timing, guarantees both futures queue here.
+                assert!(burst.as_mut().poll(cx).is_pending());
+                assert!(read.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            release_tx.send(()).expect("writer is waiting at the gate");
+
+            // The burst must keep being polled to release its permit after SQL
+            // completes. Awaiting only the queued read would deadlock.
+            let (writer, burst, read) = tokio::join!(writer, burst, read);
+            writer.expect("writer task").expect("gated writer");
+            burst.expect("write burst");
             read
         })
         .await
         .expect("read and burst complete together");
         assert!(outcome.expect("read succeeds").is_none());
+        assert_eq!(
+            store
+                .get_mutation_mac("regular", &rows[0].index_mac)
+                .await
+                .unwrap(),
+            Some(rows[0].value_mac.clone())
+        );
     }
 
     /// `pool_size > 1` with no reader connections is reachable config, and there
@@ -7389,6 +7507,11 @@ mod read_routing_tests {
     /// Anything else matching a read-shaped name has to route through
     /// `read_query` or this test fails.
     const ON_THE_WRITE_QUEUE: &[(&str, &str)] = &[
+        (
+            "get_sent_message",
+            "retries SQLITE_BUSY on the write queue: a read error skips the repair, \
+             so retain the consuming lookup's retry behavior without deleting the row",
+        ),
         (
             "get_pending_inbound",
             "retries SQLITE_BUSY on the write queue: a read error here fails closed \

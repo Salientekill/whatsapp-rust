@@ -573,7 +573,7 @@ impl Client {
 
             pending_device_sync: crate::pending_device_sync::PendingDeviceSync::new(),
 
-            pending_group_device_resync: crate::pending_device_sync::PendingDeviceSync::new(),
+            pending_group_device_resync: crate::send::group_repair::GroupRepair::new(),
 
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
@@ -1487,6 +1487,7 @@ impl Client {
             .flush(&*self.runtime, Duration::from_secs(5))
             .await;
         self.notify_connection_shutdown();
+        self.pending_group_device_resync.clear();
 
         if let Err(e) = self.persistence_manager.flush().await {
             log::error!("Failed to flush device state during disconnect: {e}");
@@ -1913,6 +1914,7 @@ impl Client {
         // permit-held cache settle below, so no rowless ratchet advances can
         // dirty the cache behind teardown's back.
         let closed_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst);
+        self.pending_group_device_resync.clear();
         #[cfg(feature = "client-lifecycle")]
         let scope_close = self.lifecycle.as_ref().map(|lifecycle| {
             let lifecycle = Arc::clone(lifecycle);

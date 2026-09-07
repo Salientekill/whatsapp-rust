@@ -26,6 +26,7 @@ use crate::request::IqError;
 use thiserror::Error;
 
 mod actions;
+pub(crate) mod group_repair;
 mod tctoken_lifecycle;
 
 /// Error returned by the message send path ([`Client::send_message`],
@@ -207,6 +208,8 @@ pub(crate) fn skdm_memo_entry_stale_term(
 /// send_node(). This matches WhatsApp Web which only calls markHasSenderKey()
 /// after server ACK.
 struct SkdmUpdate {
+    topology_generation: u64,
+    group_info: std::sync::Arc<wacore::client::context::GroupInfo>,
     to_str: String,
     devices: Vec<Jid>,
     stale_users: Vec<String>,
@@ -237,6 +240,7 @@ struct SendBranchOutput {
     /// DM branch only: the device set the stanza covered, shared with the memo
     /// entry it came from. Handed to the phash waiter as its exclude list.
     dm_devices: Option<std::sync::Arc<wacore::send::ResolvedDmDevices>>,
+    group_devices: Option<std::sync::Arc<wacore::send::ResolvedGroupDevices>>,
     /// Of those, the ones that produced no `<enc>`. Empty on a complete fan-out.
     dm_unreached: Vec<Jid>,
 }
@@ -307,17 +311,14 @@ fn sort_session_lock_keys(keys: &mut Vec<Jid>) {
     keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
 }
 
-/// How long a group is held after a resync before another mismatch may schedule
-/// one. Long enough that a divergence the refresh cannot settle costs one
-/// participant query rather than one per message; short enough that a real
-/// change minutes later is still repaired well inside the hour a registry entry
-/// would otherwise live.
-#[cfg(not(test))]
+/// Bounds repeated refreshes when the server keeps rejecting the same device set.
 const GROUP_DEVICE_RESYNC_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
-/// The resync runs on a detached task, which a test's paused clock does not
-/// reach, so the wait is shortened here rather than driven by `advance`.
-#[cfg(test)]
-const GROUP_DEVICE_RESYNC_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn group_distribution_targets(devices: &wacore::send::ResolvedGroupDevices, own: &Jid) -> Vec<Jid> {
+    let mut targets = devices.devices().to_vec();
+    wacore::send::retain_skdm_distribution_targets(&mut targets, own);
+    targets
+}
 
 /// True when every SKDM target belongs to our own account (PN or LID user).
 /// Own devices are never memoized warm (WA Web's `!isMeDevice` guard on
@@ -360,6 +361,7 @@ impl SendBranchOutput {
             ack_phash: None,
             recipient_fanout: None,
             dm_devices: None,
+            group_devices: None,
             dm_unreached: Vec::new(),
         }
     }
@@ -1247,6 +1249,7 @@ impl Client {
     ) -> Result<SendResult, SendError> {
         use wacore::client::context::GroupInfo;
         use wacore_binary::builder::NodeBuilder;
+        let topology_generation = self.device_topology.current();
 
         if recipients.is_empty() {
             return Err(SendError::InvalidRequest(
@@ -1490,8 +1493,13 @@ impl Client {
             return Err(e.into());
         }
 
-        self.update_sender_key_devices(&to_str, &prepared.skdm_devices)
-            .await;
+        self.update_sender_key_devices(
+            &to_str,
+            &prepared.skdm_devices,
+            topology_generation,
+            Some(&group_info),
+        )
+        .await;
         drop(distribution_guard);
 
         for user in &prepared.stale_device_users {
@@ -1819,9 +1827,45 @@ impl Client {
     /// would be one-directional: the retry-receipt forget path also excludes own
     /// devices (to stop an inbound retry tearing down our own session), so an own
     /// companion whose one SKDM encryption failed could never be re-sent one.
-    pub(crate) async fn update_sender_key_devices(&self, group_jid: &str, devices: &[Jid]) {
+    pub(crate) async fn update_sender_key_devices(
+        &self,
+        group_jid: &str,
+        devices: &[Jid],
+        topology_generation: u64,
+        group_info: Option<&wacore::client::context::GroupInfo>,
+    ) {
         if devices.is_empty() {
             return;
+        }
+
+        // Callers retain the distribution lock. Registry cleanup must finish either
+        // before this check or after the warm writes, never between them.
+        let _registry = self.device_topology.lock_registry().await;
+        if self.device_topology.current() != topology_generation {
+            let mut members = crate::client::member_index::MemberIndex::builder(devices.len() * 3);
+            for device in devices {
+                members.insert(&device.user);
+                if let Some(pn) =
+                    group_info.and_then(|info| info.phone_jid_for_lid_user(&device.user))
+                {
+                    members.insert(&pn.user);
+                }
+                if device.is_lid()
+                    && let Some(alias) = self.lid_pn_cache.get_phone_number(&device.user).await
+                {
+                    members.insert(&alias);
+                } else if !device.is_lid()
+                    && let Some(alias) = self.lid_pn_cache.get_current_lid(&device.user).await
+                {
+                    members.insert(&alias);
+                }
+            }
+            if !self
+                .device_topology
+                .unchanged_for(topology_generation, &members.build())
+            {
+                return;
+            }
         }
 
         // No invalidation on success: set_sender_key_status_for_devices
@@ -1873,11 +1917,7 @@ impl Client {
             }
         }
         let jid_str = jid.to_string();
-        // A group forgets neither its sender keys nor its device rows here:
-        // either would cost a full fan-out or a full re-resolve on every message
-        // while the divergence lasts. What it does do is ask the server for the
-        // members' device lists once, after the metadata invalidation below —
-        // see `resync_group_participant_devices`.
+        // Group repair preserves sender keys and replaces device rows only after refresh.
         let mut flush_fallback = false;
         if jid.is_status_broadcast() {
             let distribution_guard = self.group_distribution_lock(jid).await;
@@ -1905,124 +1945,28 @@ impl Client {
                 .flush_signal_cache_batch_safe_logged("phash-mismatch-fallback", None)
                 .await;
         }
-        if invalidate_group_cache {
+        if invalidate_group_cache && !jid.is_group() {
             self.lock_group_metadata(jid).await.invalidate().await;
         }
-        // After the invalidation, never before: the task's first act is to read
-        // the participant list, and a snapshot captured ahead of the drop is the
-        // stale one — on a multithreaded runtime it would refresh devices for
-        // the membership the mismatch is telling us to stop trusting. WA Web
-        // orders it the same way: `WAWebResendGroupMsg` awaits `sendQueryGroup`,
-        // and `queryGroupJob` hands the participants it *returned* to the device
-        // sync.
         if jid.is_group() {
-            self.resync_group_participant_devices(jid).await;
+            let client = std::sync::Arc::clone(self);
+            let group = jid.clone();
+            let generation = self
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let shutdown = self.connection_shutdown_signal();
+            self.runtime.spawn_detached(Box::pin(async move {
+                let refresh = client.refresh_group_for_repair(&group, generation);
+                let cancelled = wacore::runtime::wait_for_shutdown(&shutdown);
+                futures::pin_mut!(refresh, cancelled);
+                let _ = futures::future::select(cancelled, refresh).await;
+            }));
         }
         // Last, so the re-resolve below reads through the invalidations above
         // rather than racing them.
         if let Some(resend) = resend {
             self.resend_dm_to_uncovered_devices(jid, resend).await;
         }
-    }
-
-    /// Ask the server for the group members' device lists after it told us ours
-    /// disagrees with its own.
-    ///
-    /// The group arm of a `phash` mismatch used to stop at the metadata
-    /// invalidation, which re-reads the participant list and nothing else. A
-    /// device is not a participant: when the divergence is a companion linked, a
-    /// phone restored or an app reinstalled — the notification for which can be
-    /// missed while the client is offline — the member set is unchanged and every
-    /// subsequent send resolves the same cached devices. The new device is then
-    /// outside the resolved set, so it is never an SKDM target and cannot decrypt
-    /// anything the group sends. Nothing shortens that: the registry entry lives
-    /// an hour, and the only other repair is a retry receipt from the device
-    /// itself, which arrives when its owner happens to interact with a message
-    /// they cannot read.
-    ///
-    /// So the mismatch — the one signal the server gives us — refreshes the
-    /// members' device lists. One usync for the whole participant list, in the
-    /// background, deduplicated per group: a divergence spanning several sends
-    /// asks once, not once per message, which is the cost the metadata-only arm
-    /// was avoiding.
-    async fn resync_group_participant_devices(self: &std::sync::Arc<Self>, group: &Jid) {
-        if !self.pending_group_device_resync.add(group) {
-            return;
-        }
-        let client = std::sync::Arc::clone(self);
-        let group = group.clone();
-        self.runtime.spawn_detached(Box::pin(async move {
-            // A guard, not a trailing call: the query can fail or be cancelled
-            // with the runtime, and the dedup must not outlive the work.
-            let release = scopeguard::guard((), {
-                let client = std::sync::Arc::clone(&client);
-                let group = group.clone();
-                move |()| client.pending_group_device_resync.remove(&group)
-            });
-            let _release = release;
-
-            // The work in a block of its own: an early return inside it must not
-            // skip the cooldown below, which is what keeps a group that cannot
-            // be repaired from paying a participant query per message.
-            let work = async {
-                // `Refresh`, not the cache-preferred read: ordering alone leaves the
-                // window where `invalidate_group_cache` is false, and there the warm
-                // snapshot is exactly the membership the server just disagreed with.
-                let info = match client
-                    .groups()
-                    .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
-                    .await
-                {
-                    Ok(info) => info,
-                    Err(e) => {
-                        log::warn!(
-                            "phash mismatch for {}: could not read the participant list: {e:?}",
-                            group.observe()
-                        );
-                        return;
-                    }
-                };
-                // The send path's own resolver, with `Refresh`. It maps a mapped LID
-                // to its phone JID (usync is unreliable for LIDs), appends our own
-                // sending identity — a snapshot may omit it, and a companion we just
-                // linked is a device the mismatch can be about — and publishes
-                // through the authoritative path, which keeps the previous snapshot
-                // until the replacement lands and refuses a response a device
-                // notification overtook. Sharing it is also what keeps the repair
-                // asking about the same identities as the send it is repairing.
-                // The snapshot is held for the call and its identity borrowed,
-                // not cloned: a `Device` field read is a borrow off the cached Arc.
-                let snapshot = client.persistence_manager.get_device_snapshot();
-                let own_sending = match info.addressing_mode {
-                    AddressingMode::Lid => snapshot.lid.as_ref(),
-                    AddressingMode::Pn => snapshot.pn.as_ref(),
-                };
-                let Some(own_sending) = own_sending else {
-                    return;
-                };
-                if let Err(e) = client
-                    .resolve_group_devices_uncached(
-                        &info,
-                        own_sending,
-                        crate::cache::Freshness::Refresh,
-                    )
-                    .await
-                {
-                    log::warn!(
-                        "phash mismatch for {}: participant device resync failed: {e:?}",
-                        group.observe()
-                    );
-                }
-            };
-            work.await;
-
-            // Hold the mark past the work. The set alone dedups only what
-            // overlaps a resync in flight, and sequential sends arrive after it:
-            // a divergence the refresh cannot settle — a rejected or rate-limited
-            // usync, a server that keeps disagreeing — would otherwise pay a full
-            // participant query per message, the cost this arm exists to avoid.
-            client.runtime.sleep(GROUP_DEVICE_RESYNC_COOLDOWN).await;
-        }));
     }
 
     /// Deliver a DM to the devices a refreshed list holds and the sent stanza
@@ -2233,9 +2177,26 @@ impl Client {
         // Callers that already stamped their message hand the instant down; the
         // rest sample here so the pipeline below still has exactly one.
         let sent_at = sent_at.unwrap_or_else(SendInstant::now);
+        let send_generation = self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let group_identity = if to.is_group() {
+            group_repair::GroupIdentitySnapshot::capture(self)
+        } else {
+            group_repair::GroupIdentitySnapshot::default()
+        };
         validate_extra_stanza_nodes(&extra_stanza_nodes)?;
         if request_id_override.is_some_and(str::is_empty) {
             return Err(SendError::InvalidRequest("message ID must not be empty".into()).into());
+        }
+        if to.is_group()
+            && let Some(protocol) = message.protocol_message.as_option()
+            && protocol.r#type == Some(wa::message::protocol_message::Type::REVOKE)
+            && let Some(key) = protocol.key.as_option()
+            && key.from_me == Some(true)
+            && let Some(id) = key.id.as_deref()
+        {
+            self.cancel_group_message_repair(&to, id);
         }
         // Newsletters are plaintext channels and never use the E2E path. Text
         // sends go through the <plaintext> branch in send_message_with_options;
@@ -2302,6 +2263,7 @@ impl Client {
             ack_phash,
             recipient_fanout,
             dm_devices: covered_dm_devices,
+            group_devices,
             dm_unreached,
         } = if peer && !to.is_group() {
             box_send_branch(self.send_peer_branch(to, message, request_id)).await?
@@ -2356,18 +2318,57 @@ impl Client {
             Some(request_id),
             "branch stanza must carry the id this send was named with"
         );
+        if group_devices.is_some()
+            && self
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != send_generation
+        {
+            anyhow::bail!("connection changed while preparing group message");
+        }
         let ack_message_id = if !borrowed_message_id && let Some(phash) = ack_phash {
-            // Group sends also invalidate group cache on mismatch: the server's
-            // participant set diverged, so the next send needs a fresh query.
+            // Group refresh and message resend have separate lifetimes.
             let invalidate_group = tc_issue_target.is_group();
-            self.register_phash_waiter(
-                request_id,
-                phash,
-                tc_issue_target.clone(),
-                invalidate_group,
-                covered_dm_devices,
-                dm_unreached,
-            );
+            if let Some(devices) = group_devices {
+                let mut waiters = self.response_waiters_guard();
+                let registered_epoch = waiters.current_epoch();
+                waiters.insert(
+                    request_id.to_string(),
+                    crate::client::ResponseWaiter::GroupPhash(
+                        crate::client::PhashWaiter {
+                            expected: phash,
+                            jid: tc_issue_target.clone(),
+                            invalidate_group_cache: true,
+                            dm_devices: None,
+                            dm_unreached: Vec::new(),
+                            registered_epoch,
+                        },
+                        group_repair::GroupSendSnapshot {
+                            connection_generation: send_generation,
+                            identity: group_identity,
+                            devices,
+                            message_secret: outbound_msg_secret,
+                            addressing_mode: if outbound_group_sender_identity
+                                .as_ref()
+                                .is_some_and(Jid::is_lid)
+                            {
+                                AddressingMode::Lid
+                            } else {
+                                AddressingMode::Pn
+                            },
+                        },
+                    ),
+                );
+            } else {
+                self.register_phash_waiter(
+                    request_id,
+                    phash,
+                    tc_issue_target.clone(),
+                    invalidate_group,
+                    covered_dm_devices,
+                    dm_unreached,
+                );
+            }
             Some(request_id)
         } else {
             None
@@ -2413,8 +2414,13 @@ impl Client {
         }
 
         if let Some(update) = skdm_update {
-            self.update_sender_key_devices(&update.to_str, &update.devices)
-                .await;
+            self.update_sender_key_devices(
+                &update.to_str,
+                &update.devices,
+                update.topology_generation,
+                Some(&update.group_info),
+            )
+            .await;
             for user in &update.stale_users {
                 self.invalidate_device_cache(user).await;
             }
@@ -2490,6 +2496,7 @@ impl Client {
             device_freshness,
             borrowed_message_id,
         } = request;
+        let topology_generation = self.device_topology.current();
         // Every arm of the prepare match below assigns these four.
         let outbound_msg_secret: Option<[u8; 32]>;
         let outbound_group_sender_identity: Option<Jid>;
@@ -2500,6 +2507,7 @@ impl Client {
         // this is the only signal a bot gets that its participant device set is
         // stale without a member sending something first.
         let group_ack_phash: Option<wacore_binary::CompactString>;
+        let group_devices;
         let mut distribution_guard: Option<async_lock::MutexGuardArc<()>> = None;
         let node = {
             // No send-level lock: encrypt_group_message serializes the
@@ -2628,22 +2636,17 @@ impl Client {
             // `all_devices_for_phash` carries the FULL resolved set so the phash
             // covers every device + self even on a warm send (WA Web sends a
             // phash on every group send); `skdm_target_devices` is the subset
-            // still missing the key. On the cold/`force_skdm` path both are
-            // `None` and `prepare_group_stanza` resolves the set itself.
+            // still missing the key. Cold sends derive both from the same snapshot.
             let (all_devices_for_phash, skdm_target_devices): (
                 Option<GroupDeviceSnapshot>,
                 Option<Vec<Jid>>,
             ) = if force_skdm {
-                match refreshed_devices {
-                    Some(mut targets) => {
-                        wacore::send::retain_skdm_distribution_targets(
-                            &mut targets,
-                            &own_sending_jid,
-                        );
-                        (None, Some(targets))
-                    }
-                    None => (None, None),
-                }
+                (
+                    refreshed_devices.map(|all| {
+                        GroupDeviceSnapshot::Owned(wacore::send::ResolvedGroupDevices::new(all))
+                    }),
+                    None,
+                )
             } else {
                 let initial_targets = match refreshed_devices {
                     Some(all) => {
@@ -2728,6 +2731,31 @@ impl Client {
                 }
             };
 
+            let addressed = match all_devices_for_phash {
+                Some(GroupDeviceSnapshot::Shared(all)) => all,
+                Some(GroupDeviceSnapshot::Owned(all)) => std::sync::Arc::new(all),
+                None => std::sync::Arc::new(wacore::send::ResolvedGroupDevices::new(
+                    self.resolve_group_devices_uncached(
+                        &group_info,
+                        &own_sending_jid,
+                        crate::cache::Freshness::CachePreferred,
+                    )
+                    .await?,
+                )),
+            };
+            let skdm_target_devices = match skdm_target_devices {
+                Some(targets) => targets,
+                None if force_skdm => group_distribution_targets(&addressed, &own_sending_jid),
+                None => {
+                    let cached_map = self.skdm_device_map(&to_str).await;
+                    self.filter_skdm_targets(
+                        &to_str,
+                        addressed.devices(),
+                        &cached_map,
+                        &own_sending_jid,
+                    )
+                }
+            };
             match wacore::send::prepare_group_stanza(
                 &*self.runtime,
                 &mut stores,
@@ -2741,9 +2769,9 @@ impl Client {
                     message,
                     message_id: request_id,
                     force_distribution: force_skdm,
-                    distribution_targets: skdm_target_devices,
+                    distribution_targets: Some(skdm_target_devices),
                     distribution_policy: wacore::send::SenderKeyDistributionPolicy::BestEffort,
-                    phash_devices: all_devices_for_phash.as_ref().map(AsRef::as_ref),
+                    phash_devices: Some(&addressed),
                     edit: edit.as_ref(),
                     extra_nodes: extra_stanza_nodes,
                     pre_encoded: shared_content.as_deref().map(Vec::as_slice),
@@ -2767,6 +2795,8 @@ impl Client {
                     };
                     skdm_update = (!devices.is_empty() || !prepared.stale_device_users.is_empty())
                         .then(|| SkdmUpdate {
+                            topology_generation,
+                            group_info: std::sync::Arc::clone(&group_info_for_memo),
                             to_str,
                             devices,
                             stale_users: prepared.stale_device_users,
@@ -2774,6 +2804,7 @@ impl Client {
                     outbound_msg_secret = prepared.message_secret;
                     outbound_group_sender_identity = Some(prepared.sender_identity);
                     group_ack_phash = prepared.phash;
+                    group_devices = Some(addressed);
                     prepared.node
                 }
                 Err(e) => {
@@ -2809,13 +2840,13 @@ impl Client {
                         } else {
                             None
                         };
-                        let (retry_force, retry_targets, retry_all) = match warm_targets {
-                            Some((all, needs)) => {
-                                (false, Some(needs), Some(GroupDeviceSnapshot::Shared(all)))
-                            }
+                        let (retry_force, retry_targets, retry_addressed) = match warm_targets {
+                            Some((all, needs)) => (false, Some(needs), all),
                             None => {
                                 self.reset_sender_key_device_tracking(&to_str).await?;
-                                (true, None, None)
+                                let targets =
+                                    group_distribution_targets(&addressed, &own_sending_jid);
+                                (true, Some(targets), addressed)
                             }
                         };
 
@@ -2839,7 +2870,7 @@ impl Client {
                                 distribution_targets: retry_targets,
                                 distribution_policy:
                                     wacore::send::SenderKeyDistributionPolicy::BestEffort,
-                                phash_devices: retry_all.as_ref().map(AsRef::as_ref),
+                                phash_devices: Some(&retry_addressed),
                                 edit: edit.as_ref(),
                                 extra_nodes: extra_stanza_nodes,
                                 pre_encoded: shared_content.as_deref().map(Vec::as_slice),
@@ -2848,6 +2879,8 @@ impl Client {
                         .await?;
 
                         skdm_update = Some(SkdmUpdate {
+                            topology_generation,
+                            group_info: std::sync::Arc::clone(&group_info_for_memo),
                             to_str,
                             devices: retry_prepared.skdm_devices,
                             stale_users: retry_prepared.stale_device_users,
@@ -2855,6 +2888,7 @@ impl Client {
                         outbound_msg_secret = retry_prepared.message_secret;
                         outbound_group_sender_identity = Some(retry_prepared.sender_identity);
                         group_ack_phash = retry_prepared.phash;
+                        group_devices = Some(retry_addressed);
                         retry_prepared.node
                     } else {
                         return Err(e);
@@ -2870,6 +2904,7 @@ impl Client {
             distribution_guard,
             issue_tc_token_after_send: false,
             ack_phash: group_ack_phash,
+            group_devices,
             recipient_fanout: None,
             dm_devices: None,
             dm_unreached: Vec::new(),
@@ -3059,6 +3094,7 @@ impl Client {
             // status message rather than to the device it names.
             recipient_fanout: (!is_status_addon).then_some(prepared.recipient_fanout),
             dm_devices: (!is_status_addon).then_some(dm_devices),
+            group_devices: None,
             dm_unreached: if is_status_addon {
                 Vec::new()
             } else {
@@ -3342,42 +3378,23 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
 
-        assert!(
-            client.pending_group_device_resync.add(&group),
-            "the first mark is the one in flight"
-        );
-        client.resync_group_participant_devices(&group).await;
-        assert!(
-            !client.pending_group_device_resync.add(&group),
-            "a second mismatch must leave the in-flight mark standing, not clear it"
-        );
+        client.refresh_group_for_repair(&group, 0).await;
+        client.refresh_group_for_repair(&group, 0).await;
+        assert_eq!(client.pending_group_device_resync.len(), 1);
     }
 
-    /// Both halves of the mark's life. It has to outlive the work — the set
-    /// alone dedups what overlaps a resync in flight, and sequential sends
-    /// arrive after it, so a divergence the refresh cannot settle would pay a
-    /// participant query per message. And it has to clear afterwards: the guard
-    /// runs on drop, so the outcome does not decide whether it fires, but if a
-    /// refactor drops it, every later mismatch for that group is deduplicated
-    /// away forever while the seeded-mark test above still passes.
     #[tokio::test]
-    async fn a_group_resync_holds_its_mark_through_the_cooldown_then_clears_it() {
+    async fn a_group_resync_holds_its_mark_until_disconnect() {
         let client = crate::test_utils::create_test_client().await;
         let group: Jid = "120363000000000003@g.us".parse().unwrap();
 
-        client.resync_group_participant_devices(&group).await;
+        client.refresh_group_for_repair(&group, 0).await;
         // No socket here, so the work ends at once: what holds the mark now is
         // the cooldown, not a query still running.
         tokio::task::yield_now().await;
-        assert!(
-            !client.pending_group_device_resync.add(&group),
-            "the mark must stand through the cooldown"
-        );
-
-        crate::test_utils::poll_until("the cooldown to release the mark", || {
-            client.pending_group_device_resync.add(&group)
-        })
-        .await;
+        assert_eq!(client.pending_group_device_resync.len(), 1);
+        client.disconnect().await;
+        assert_eq!(client.pending_group_device_resync.len(), 0);
     }
 
     /// The two queues are separate on purpose: the offline drain resolves every
@@ -3388,7 +3405,7 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
         let group: Jid = "120363000000000002@g.us".parse().unwrap();
 
-        client.resync_group_participant_devices(&group).await;
+        client.refresh_group_for_repair(&group, 0).await;
 
         assert!(
             client.pending_device_sync.take_all().is_empty(),
@@ -3687,6 +3704,10 @@ mod tests {
 
             let is_lid = addressing_mode == AddressingMode::Lid;
             let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetAccount(Some(peer_test_account_proto())))
+                .await;
             let own = Jid::from_str("5511000000001@s.whatsapp.net").unwrap();
             let own_lid = Jid::from_str("100000000000001@lid").unwrap();
             client
@@ -4652,7 +4673,12 @@ mod tests {
         // The client half of the loop: what the send reports is what gets
         // persisted, and what is persisted decides the next send's targets.
         client
-            .update_sender_key_devices(&group_str, &prepared.skdm_devices)
+            .update_sender_key_devices(
+                &group_str,
+                &prepared.skdm_devices,
+                client.device_topology.current(),
+                Some(&group_info),
+            )
             .await;
         let (_all, needs) = client
             .resolve_skdm_targets_memoized(&group, &group_str, &group_info, &own)
@@ -4746,7 +4772,7 @@ mod tests {
             .remove(message_id)
             .expect("a group send must wait on the ack's phash");
         match waiter {
-            crate::client::ResponseWaiter::Phash(waiter) => {
+            crate::client::ResponseWaiter::GroupPhash(waiter, _) => {
                 assert_eq!(
                     waiter.expected.as_str(),
                     on_wire,
@@ -4762,10 +4788,7 @@ mod tests {
         }
     }
 
-    /// The protected path, broken on purpose: the server answers with a phash
-    /// that disagrees with ours. `resendGroupMsg` answers that with
-    /// `sendQueryGroup`, so the group's metadata snapshot has to go and the next
-    /// send resolves its participants from the server.
+    /// Refresh preserves the last usable metadata snapshot until its replacement arrives.
     #[tokio::test]
     async fn a_disagreeing_ack_phash_re_queries_the_group() {
         let fixture = GroupSendFixture::new().await;
@@ -4788,20 +4811,19 @@ mod tests {
             "the send's waiter must claim its own ack"
         );
 
-        // handle_phash_mismatch runs detached off the read loop.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while fixture
+        fixture
+            .next_iq_id_with_xmlns(1, "w:g2")
+            .await
+            .expect("a disagreeing phash must refresh group metadata");
+        assert!(
+            fixture
                 .client
                 .get_group_cache()
                 .get(&fixture.group)
                 .await
-                .is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a disagreeing phash must drop the group snapshot that produced it");
+                .is_some(),
+            "the previous snapshot remains usable until refresh succeeds"
+        );
     }
 
     /// The repair has to act on the membership the server returns, not on the
@@ -5715,7 +5737,12 @@ mod tests {
 
         // A send marks its full target set warm (own companion + external member).
         client
-            .update_sender_key_devices(group, &[own_companion.clone(), member.clone()])
+            .update_sender_key_devices(
+                group,
+                &[own_companion.clone(), member.clone()],
+                client.device_topology.current(),
+                None,
+            )
             .await;
 
         // Persisted: the external member is warm; our own companion was skipped.
@@ -5775,7 +5802,12 @@ mod tests {
 
         // Own-only mark (the every-send steady state): nothing written, cache kept.
         client
-            .update_sender_key_devices(group, std::slice::from_ref(&own_primary))
+            .update_sender_key_devices(
+                group,
+                std::slice::from_ref(&own_primary),
+                client.device_topology.current(),
+                None,
+            )
             .await;
         client
             .sender_key_device_cache
@@ -5787,7 +5819,12 @@ mod tests {
         // An external member writes a warm mark: the cached map must drop so
         // the next send re-reads the new state.
         client
-            .update_sender_key_devices(group, &[own_primary, member])
+            .update_sender_key_devices(
+                group,
+                &[own_primary, member],
+                client.device_topology.current(),
+                None,
+            )
             .await;
         let rebuilt = std::sync::atomic::AtomicBool::new(false);
         client
@@ -7138,7 +7175,7 @@ mod tests {
             .await;
     }
 
-    fn peer_test_account_proto() -> wa::ADVSignedDeviceIdentity {
+    pub(super) fn peer_test_account_proto() -> wa::ADVSignedDeviceIdentity {
         wa::ADVSignedDeviceIdentity {
             details: Some(vec![0u8; 32]),
             account_signature_key: Some(vec![0u8; 32]),
@@ -8442,10 +8479,7 @@ mod tests {
         );
     }
 
-    /// The mismatch handler is only armed for a DM. A group answers its own
-    /// mismatch by re-querying metadata, and a status reaction keeps
-    /// `status@broadcast` as its chat, so neither may enter the pairwise
-    /// resend: it would address a retransmission to the wrong route.
+    /// Group repair retains a group snapshot rather than taking the DM retry route.
     #[tokio::test]
     async fn a_group_phash_mismatch_arms_no_dm_resend() {
         let fixture = GroupSendFixture::new().await;
@@ -8457,13 +8491,724 @@ mod tests {
             .response_waiters_guard()
             .remove(message_id)
             .expect("the group send registered its phash waiter");
-        let crate::client::ResponseWaiter::Phash(waiter) = waiter else {
+        let crate::client::ResponseWaiter::GroupPhash(waiter, devices) = waiter else {
             panic!("a phash send registers a phash waiter");
         };
         assert!(
             waiter.dm_devices.is_none(),
             "a group send must not carry a DM exclude list"
         );
+        assert!(!devices.devices.devices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn group_repairs_each_original_id_only_to_missed_devices() {
+        use wacore::libsignal::protocol::{
+            CiphertextMessage, GenericSignedPreKey, IdentityKey, PreKeyBundle, PreKeySignalMessage,
+            SignalMessage, SignedPreKeyStore, UsePQRatchet, message_decrypt, process_prekey_bundle,
+        };
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        let fixture = GroupSendFixture::new().await;
+        let ids = ["GROUPREPAIR1", "GROUPREPAIR2"];
+        let mut snapshots = Vec::new();
+        for id in ids {
+            fixture
+                .client
+                .send_message_with_options(
+                    fixture.group.clone(),
+                    wa::Message::text(id),
+                    SendOptions::default().with_message_id(id),
+                )
+                .await
+                .unwrap();
+            let Some(crate::client::ResponseWaiter::GroupPhash(_, devices)) =
+                fixture.client.response_waiters_guard().remove(id)
+            else {
+                panic!("group waiter missing");
+            };
+            snapshots.push(devices);
+        }
+        let mut missed = fixture.member.clone();
+        missed.device = 2;
+        let receiver = crate::test_utils::create_test_client().await;
+        receiver
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(missed.clone())))
+            .await;
+        let receiver_device = receiver.persistence_manager.get_device_snapshot();
+        let mut receiver_stores = receiver.signal_adapter();
+        let signed_key = receiver_stores
+            .signed_pre_key_store
+            .get_signed_pre_key(1.into())
+            .await
+            .unwrap();
+        let bundle = PreKeyBundle::new(
+            receiver_device.core.registration_id,
+            u32::from(missed.device).into(),
+            None,
+            1.into(),
+            signed_key.public_key().unwrap(),
+            signed_key.signature().unwrap(),
+            IdentityKey::new(receiver_device.core.identity_key.public_key),
+        )
+        .unwrap();
+        let mut sender_stores = fixture.client.signal_adapter();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        process_prekey_bundle(
+            &missed.to_protocol_address(),
+            &mut sender_stores.session_store,
+            &mut sender_stores.identity_store,
+            &bundle,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .unwrap();
+        fixture
+            .client
+            .device_registry_cache
+            .raw_insert_for_tests(
+                Arc::from(fixture.member.user.as_str()),
+                Arc::new(DeviceListRecord {
+                    user: fixture.member.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(2, None)].into(),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                }),
+            )
+            .await;
+        let generation = fixture
+            .client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let refresh = fixture
+            .client
+            .pending_group_device_resync
+            .refresh(generation, &fixture.group);
+        *refresh.lock().await = Some(true);
+        let before = fixture.transport.sent_count();
+        let device = fixture.client.persistence_manager.get_device_snapshot();
+        let key_name = wacore::libsignal::store::sender_key_name::SenderKeyName::from_parts(
+            &fixture.group.to_string(),
+            fixture.own_sending.to_protocol_address().as_str(),
+        );
+        let sender_key_before = fixture
+            .client
+            .signal_cache
+            .get_sender_key(&key_name, &*device.backend)
+            .await
+            .unwrap()
+            .unwrap();
+        let (first, second) = futures::join!(
+            fixture.client.repair_group_message(
+                &fixture.group,
+                ids[0],
+                snapshots[0].clone(),
+                generation
+            ),
+            fixture.client.repair_group_message(
+                &fixture.group,
+                ids[1],
+                snapshots[1].clone(),
+                generation
+            ),
+        );
+        first.unwrap();
+        second.unwrap();
+        let sender_key_after = fixture
+            .client
+            .signal_cache
+            .get_sender_key(&key_name, &*device.backend)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sender_key_before.serialize().unwrap(),
+            sender_key_after.serialize().unwrap(),
+            "direct repair must not rotate, advance, or redistribute the sender key"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for index in before..before + 2 {
+            let owned = fixture.stanza(index).await;
+            let node = owned.get();
+            seen.insert(node.attrs().optional_string("id").unwrap().to_string());
+            assert_eq!(node.attrs().optional_jid("to"), Some(fixture.group.clone()));
+            assert_eq!(
+                node.attrs().optional_string("device_fanout").as_deref(),
+                Some("false")
+            );
+            let participants = node.get_optional_child("participants").unwrap();
+            let targets: Vec<_> = participants
+                .children()
+                .unwrap()
+                .iter()
+                .map(|child| child.attrs().optional_jid("jid").unwrap())
+                .collect();
+            assert_eq!(targets, vec![missed.clone()]);
+            let encrypted = participants.children().unwrap()[0]
+                .get_optional_child("enc")
+                .unwrap();
+            let ciphertext = match encrypted.attrs().optional_string("type").as_deref() {
+                Some("pkmsg") => CiphertextMessage::PreKeySignalMessage(
+                    PreKeySignalMessage::try_from(encrypted.content_bytes().unwrap()).unwrap(),
+                ),
+                Some("msg") => CiphertextMessage::SignalMessage(
+                    SignalMessage::try_from(encrypted.content_bytes().unwrap()).unwrap(),
+                ),
+                other => panic!("unexpected direct encryption type {other:?}"),
+            };
+            let plaintext = message_decrypt(
+                &ciphertext,
+                &fixture.own_sending.to_protocol_address(),
+                &mut receiver_stores.session_store,
+                &mut receiver_stores.identity_store,
+                &mut receiver_stores.pre_key_store,
+                &receiver_stores.signed_pre_key_store,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .unwrap()
+            .plaintext;
+            let unpadded = wacore::messages::unpad_plaintext(plaintext, 2).unwrap();
+            let decoded = waproto::codec::message_decode(&unpadded).unwrap();
+            let id = node.attrs().optional_string("id").unwrap();
+            let original = ids
+                .iter()
+                .position(|original| *original == id.as_ref())
+                .unwrap();
+            let expected = wa::Message {
+                conversation: Some(ids[original].into()),
+                message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                    message_secret: Some(snapshots[original].message_secret.unwrap().to_vec()),
+                    reporting_token_version: Some(wacore::reporting_token::REPORTING_TOKEN_VERSION),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                waproto::codec::message_to_vec(&decoded),
+                waproto::codec::message_to_vec(&expected),
+                "direct repair must decrypt to the original protobuf and message secret"
+            );
+            let marker = node.get_optional_child("enc").unwrap();
+            assert_eq!(
+                marker.attrs().optional_string("type").as_deref(),
+                Some("skmsg")
+            );
+            assert!(marker.content_bytes().is_none_or(|bytes| bytes.is_empty()));
+        }
+        assert_eq!(
+            seen,
+            ids.into_iter()
+                .map(str::to_owned)
+                .collect::<std::collections::HashSet<_>>()
+        );
+        assert!(fixture.client.response_waiters_guard().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_cold_send_uses_one_snapshot_for_skdm_phash_and_waiter() {
+        use buffa::Message;
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        let fixture = GroupSendFixture::with_addressing(AddressingMode::Pn, 1).await;
+        let mut refreshed = fixture.member.clone();
+        refreshed.device = 2;
+        crate::test_utils::seed_peer_session(&fixture.client, &refreshed).await;
+        let guard = fixture.client.group_distribution_lock(&fixture.group).await;
+        let mutex = fixture
+            .client
+            .group_distribution_locks
+            .get(&fixture.group)
+            .await
+            .unwrap();
+        let owners = Arc::strong_count(&mutex);
+        let client = Arc::clone(&fixture.client);
+        let group = fixture.group.clone();
+        let send = tokio::spawn(async move {
+            client
+                .send_message_with_options(
+                    group,
+                    wa::Message::text("snapshot"),
+                    SendOptions::default()
+                        .with_message_id("FROZENGROUPDEVICES")
+                        .with_device_freshness(crate::cache::Freshness::Refresh),
+                )
+                .await
+        });
+        let iq_id = fixture.next_iq_id_with_xmlns(0, "usync").await.unwrap();
+        let users = [&fixture.member, &fixture.own_sending]
+            .into_iter()
+            .map(|jid| {
+                let mut devices = vec![NodeBuilder::new("device").attr("id", "0").build()];
+                if jid == &fixture.member {
+                    devices.push(
+                        NodeBuilder::new("device")
+                            .attr("id", "2")
+                            .attr("key-index", "2")
+                            .build(),
+                    );
+                }
+                let index = wa::ADVKeyIndexList {
+                    raw_id: Some(1),
+                    timestamp: Some(1000),
+                    current_index: Some(2),
+                    valid_indexes: if jid == &fixture.member {
+                        vec![0, 2]
+                    } else {
+                        vec![0]
+                    },
+                    ..Default::default()
+                };
+                let signed = wa::ADVSignedKeyIndexList {
+                    details: Some(index.encode_to_vec()),
+                    ..Default::default()
+                };
+                NodeBuilder::new("user")
+                    .attr("jid", jid.clone())
+                    .children([NodeBuilder::new("devices")
+                        .children([
+                            NodeBuilder::new("device-list").children(devices).build(),
+                            NodeBuilder::new("key-index-list")
+                                .attr("ts", "1000")
+                                .bytes(signed.encode_to_vec())
+                                .build(),
+                        ])
+                        .build()])
+                    .build()
+            })
+            .collect::<Vec<_>>();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", iq_id.clone())
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list").children(users).build()])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&fixture.client, &iq_id, &response).await;
+        crate::test_utils::poll_until("the cold send to hold its refreshed snapshot", || {
+            Arc::strong_count(&mutex) > owners
+        })
+        .await;
+        fixture
+            .client
+            .device_registry_cache
+            .raw_insert_for_tests(
+                Arc::from(fixture.member.user.as_str()),
+                Arc::new(DeviceListRecord {
+                    user: fixture.member.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, None)].into(),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                }),
+            )
+            .await;
+        drop(guard);
+        send.await.unwrap().unwrap();
+        let Some(crate::client::ResponseWaiter::GroupPhash(waiter, sent)) = fixture
+            .client
+            .response_waiters_guard()
+            .remove("FROZENGROUPDEVICES")
+        else {
+            panic!("group waiter missing");
+        };
+        assert!(sent.devices.devices().contains(&refreshed));
+        assert!(!sent.devices.devices().iter().any(|jid| jid.device == 3));
+        assert_eq!(
+            Some(waiter.expected.clone()),
+            sent.devices.phash(&fixture.own_sending)
+        );
+        let stanza = fixture.stanza(fixture.transport.sent_count() - 1).await;
+        let node = stanza.get();
+        assert_eq!(
+            node.attrs().optional_string("phash").as_deref(),
+            Some(waiter.expected.as_str())
+        );
+        let targets = node
+            .get_optional_child("participants")
+            .unwrap()
+            .children()
+            .unwrap()
+            .iter()
+            .map(|child| child.attrs().optional_jid("jid").unwrap())
+            .collect::<Vec<_>>();
+        assert!(targets.contains(&refreshed));
+        assert!(!targets.iter().any(|jid| jid.device == 3));
+    }
+
+    #[tokio::test]
+    async fn registry_device_reuse_during_socket_send_cannot_restore_warm_marks() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        struct PausedTransport {
+            capture: Arc<crate::transport::mock::CapturingMockTransport>,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+        }
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl crate::transport::Transport for PausedTransport {
+            async fn send(&self, data: bytes::Bytes) -> anyhow::Result<()> {
+                crate::transport::Transport::send(self.capture.as_ref(), data).await?;
+                self.entered.notify_one();
+                self.release.acquire().await.unwrap().forget();
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+
+        for changed_member in [true, false] {
+            let fixture = GroupSendFixture::with_addressing(AddressingMode::Pn, 1).await;
+            let companion = fixture.member.with_device(7);
+            crate::test_utils::seed_peer_session(&fixture.client, &companion).await;
+            fixture
+                .client
+                .update_device_list(DeviceListRecord {
+                    user: fixture.member.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(7))].into(),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                })
+                .await
+                .unwrap();
+            let transport = Arc::new(PausedTransport {
+                capture: Arc::clone(&fixture.transport),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            let socket = crate::socket::NoiseSocket::with_observers(
+                Arc::clone(&fixture.client.runtime),
+                transport.clone() as Arc<dyn crate::transport::Transport>,
+                wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+                wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+                crate::socket::noise_socket::SendObservers::with_stats(
+                    fixture.client.stats.clone(),
+                )
+                .with_sent_frames(fixture.client.sent_frame_tap.clone()),
+            );
+            *fixture.client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
+            let client = Arc::clone(&fixture.client);
+            let group = fixture.group.clone();
+            let send = tokio::spawn(async move {
+                client
+                    .send_message(group, wa::Message::text("in flight"))
+                    .await
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                transport.entered.notified(),
+            )
+            .await
+            .unwrap();
+            assert!(!send.is_finished());
+            let wire = fixture.stanza(0).await;
+            assert!(
+                wire.get()
+                    .get_optional_child("participants")
+                    .unwrap()
+                    .children()
+                    .unwrap()
+                    .iter()
+                    .any(|node| node.attrs().optional_jid("jid") == Some(companion.clone()))
+            );
+            let distribution = fixture
+                .client
+                .group_distribution_locks
+                .get(&fixture.group)
+                .await
+                .unwrap();
+            assert!(
+                distribution.try_lock().is_none(),
+                "send retains distribution ownership through the socket await"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                if changed_member {
+                    fixture
+                        .client
+                        .patch_device_remove(&fixture.member.user, 7)
+                        .await;
+                    fixture
+                        .client
+                        .update_device_list(DeviceListRecord {
+                            user: fixture.member.user.as_str().into(),
+                            devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(8))].into(),
+                            timestamp: wacore::time::now_secs(),
+                            phash: None,
+                            raw_id: None,
+                        })
+                        .await
+                        .unwrap();
+                } else {
+                    fixture
+                        .client
+                        .update_device_list(DeviceListRecord {
+                            user: "155500000099".into(),
+                            devices: [DeviceInfo::new(0, None)].into(),
+                            timestamp: wacore::time::now_secs(),
+                            phash: None,
+                            raw_id: None,
+                        })
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .expect("registry cleanup must not acquire the distribution lock");
+            transport.release.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(5), send)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let group_str = fixture.group.to_string();
+            let map = fixture.client.skdm_device_map(&group_str).await;
+            if changed_member {
+                assert_ne!(map.device_has_key(&fixture.member.user, 7), Some(true));
+                let info = fixture
+                    .client
+                    .get_group_cache()
+                    .get(&fixture.group)
+                    .await
+                    .unwrap();
+                let (_, targets) = fixture
+                    .client
+                    .resolve_skdm_targets_memoized(
+                        &fixture.group,
+                        &group_str,
+                        &info,
+                        &fixture.own_sending,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    targets.contains(&companion),
+                    "reused device id must remain an SKDM target"
+                );
+            } else {
+                assert_eq!(
+                    map.device_has_key(&fixture.member.user, 7),
+                    Some(true),
+                    "unrelated-user topology changes must not discard successful distribution marks"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_mark_revalidation_uses_the_original_group_phone_alias() {
+        let client = crate::test_utils::create_test_client().await;
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let lid: Jid = "100000000000001@lid".parse().unwrap();
+        let pn: Jid = "155500000001@s.whatsapp.net".parse().unwrap();
+        let info = wacore::client::context::GroupInfo::with_lid_to_pn_map(
+            vec![lid.clone()],
+            AddressingMode::Lid,
+            [(lid.user.clone(), pn.clone())].into_iter().collect(),
+        );
+        let generation = client.device_topology.current();
+        {
+            let registry = client.device_topology.lock_registry().await;
+            client
+                .device_topology
+                .record_registry(&registry, [pn.user.as_str()]);
+        }
+        let _distribution = client.group_distribution_lock(&group).await;
+        client
+            .update_sender_key_devices(
+                &group.to_string(),
+                &[lid.with_device(7)],
+                generation,
+                Some(&info),
+            )
+            .await;
+        assert_ne!(
+            client
+                .skdm_device_map(&group.to_string())
+                .await
+                .device_has_key(&lid.user, 7),
+            Some(true),
+            "a PN registry change must invalidate a LID distribution even without a global alias cache entry"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_group_repair_does_not_resend() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_with_id("GROUPREPAIREXPIRED").await;
+        let generation = fixture
+            .client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let refresh = fixture
+            .client
+            .pending_group_device_resync
+            .refresh(generation, &fixture.group);
+        let _blocked_refresh = refresh.lock().await;
+        assert!(
+            fixture
+                .deliver_ack("GROUPREPAIREXPIRED", Some("2:mismatch"))
+                .await
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fixture
+                .client
+                .pending_group_device_resync
+                .active_message_count(),
+            1
+        );
+        tokio::time::advance(std::time::Duration::from_secs(301)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fixture
+                .client
+                .pending_group_device_resync
+                .active_message_count(),
+            0
+        );
+        assert_eq!(fixture.transport.sent_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_revoke_blocks_pending_group_resend_only_for_our_original() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore::types::message::{MessageInfo, MessageSource};
+
+        for (from_self, admin, wrong_chat, should_cancel) in [
+            (true, false, false, true),
+            (false, true, false, true),
+            (false, false, false, false),
+            (true, false, true, false),
+        ] {
+            let fixture = GroupSendFixture::new().await;
+            let id = "GROUPREPAIRREVOKED";
+            fixture.send_with_id(id).await;
+            let mut missed = fixture.member.clone();
+            missed.device = 2;
+            crate::test_utils::seed_peer_session(&fixture.client, &missed).await;
+            fixture
+                .client
+                .device_registry_cache
+                .raw_insert_for_tests(
+                    Arc::from(fixture.member.user.as_str()),
+                    Arc::new(DeviceListRecord {
+                        user: fixture.member.user.as_str().into(),
+                        devices: [DeviceInfo::new(0, None), DeviceInfo::new(2, None)].into(),
+                        timestamp: wacore::time::now_secs(),
+                        phash: None,
+                        raw_id: None,
+                    }),
+                )
+                .await;
+            let generation = fixture
+                .client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let refresh = fixture
+                .client
+                .pending_group_device_resync
+                .refresh(generation, &fixture.group);
+            let mut blocked_refresh = refresh.lock().await;
+            assert!(fixture.deliver_ack(id, Some("2:mismatch")).await);
+            tokio::task::yield_now().await;
+            assert_eq!(
+                fixture
+                    .client
+                    .pending_group_device_resync
+                    .active_message_count(),
+                1
+            );
+
+            let revoke = wa::Message {
+                protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                    r#type: Some(wa::message::protocol_message::Type::REVOKE),
+                    key: buffa::MessageField::some(wa::MessageKey {
+                        remote_jid: Some(if wrong_chat {
+                            "120363000000000099@g.us".into()
+                        } else {
+                            fixture.group.to_string()
+                        }),
+                        id: Some(id.into()),
+                        from_me: Some(!admin),
+                        participant: admin.then(|| fixture.own_sending.to_non_ad_string()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let incoming = if from_self {
+                wa::Message {
+                    device_sent_message: buffa::MessageField::some(
+                        wa::message::DeviceSentMessage {
+                            destination_jid: Some(fixture.group.to_string()),
+                            message: buffa::MessageField::some(revoke),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }
+            } else {
+                revoke
+            };
+            let info = Arc::new(MessageInfo {
+                id: "INBOUNDREVOKE".into(),
+                source: MessageSource {
+                    chat: fixture.group.clone(),
+                    sender: if from_self {
+                        fixture.own_sending.clone()
+                    } else {
+                        fixture.member.clone()
+                    },
+                    is_from_me: from_self,
+                    is_group: true,
+                    ..Default::default()
+                },
+                edit: if admin {
+                    EditAttribute::AdminRevoke
+                } else {
+                    EditAttribute::SenderRevoke
+                },
+                ..Default::default()
+            });
+            fixture
+                .client
+                .handle_decrypted_plaintext(
+                    "msg",
+                    wacore::messages::MessageUtils::encode_and_pad(&incoming),
+                    2,
+                    0,
+                    Default::default(),
+                    &info,
+                )
+                .await
+                .unwrap();
+            *blocked_refresh = Some(true);
+            drop(blocked_refresh);
+            crate::test_utils::poll_until("the pending group repair to finish", || {
+                fixture
+                    .client
+                    .pending_group_device_resync
+                    .active_message_count()
+                    == 0
+            })
+            .await;
+            let mut copies = 0;
+            for index in 0..fixture.transport.sent_count() {
+                let stanza = fixture.stanza(index).await;
+                if stanza.get().tag == "message"
+                    && stanza.get().attrs().optional_string("id").as_deref() == Some(id)
+                {
+                    copies += 1;
+                }
+            }
+            assert_eq!(
+                copies,
+                if should_cancel { 1 } else { 2 },
+                "from_self={from_self}, admin={admin}, wrong_chat={wrong_chat}"
+            );
+        }
     }
 
     /// Deliver an ack carrying `phash` to whatever waiter claims `message_id`.
