@@ -1990,10 +1990,12 @@ impl Client {
                 // until the replacement lands and refuses a response a device
                 // notification overtook. Sharing it is also what keeps the repair
                 // asking about the same identities as the send it is repairing.
+                // The snapshot is held for the call and its identity borrowed,
+                // not cloned: a `Device` field read is a borrow off the cached Arc.
                 let snapshot = client.persistence_manager.get_device_snapshot();
                 let own_sending = match info.addressing_mode {
-                    AddressingMode::Lid => snapshot.lid.clone(),
-                    AddressingMode::Pn => snapshot.pn.clone(),
+                    AddressingMode::Lid => snapshot.lid.as_ref(),
+                    AddressingMode::Pn => snapshot.pn.as_ref(),
                 };
                 let Some(own_sending) = own_sending else {
                     return;
@@ -2001,7 +2003,7 @@ impl Client {
                 if let Err(e) = client
                     .resolve_group_devices_uncached(
                         &info,
-                        &own_sending,
+                        own_sending,
                         crate::cache::Freshness::Refresh,
                     )
                     .await
