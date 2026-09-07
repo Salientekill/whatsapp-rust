@@ -1877,7 +1877,8 @@ impl Client {
         // A group forgets neither its sender keys nor its device rows here:
         // either would cost a full fan-out or a full re-resolve on every message
         // while the divergence lasts. What it does do is ask the server for the
-        // members' device lists once — see `resync_group_participant_devices`.
+        // members' device lists once, after the metadata invalidation below —
+        // see `resync_group_participant_devices`.
         let mut flush_fallback = false;
         if jid.is_status_broadcast() {
             let distribution_guard = self.group_distribution_lock(jid).await;
@@ -1899,8 +1900,6 @@ impl Client {
             drop(distribution_guard);
         } else if !jid.is_group() {
             self.sender_key_device_cache.invalidate(&jid_str).await;
-        } else {
-            self.resync_group_participant_devices(jid).await;
         }
         if flush_fallback {
             let _ = self
@@ -1909,6 +1908,16 @@ impl Client {
         }
         if invalidate_group_cache {
             self.lock_group_metadata(jid).await.invalidate().await;
+        }
+        // After the invalidation, never before: the task's first act is to read
+        // the participant list, and a snapshot captured ahead of the drop is the
+        // stale one — on a multithreaded runtime it would refresh devices for
+        // the membership the mismatch is telling us to stop trusting. WA Web
+        // orders it the same way: `WAWebResendGroupMsg` awaits `sendQueryGroup`,
+        // and `queryGroupJob` hands the participants it *returned* to the device
+        // sync.
+        if jid.is_group() {
+            self.resync_group_participant_devices(jid).await;
         }
         // Last, so the re-resolve below reads through the invalidations above
         // rather than racing them.
@@ -1953,7 +1962,14 @@ impl Client {
             });
             let _release = release;
 
-            let info = match client.groups().query_info(&group).await {
+            // `Refresh`, not the cache-preferred read: ordering alone leaves the
+            // window where `invalidate_group_cache` is false, and there the warm
+            // snapshot is exactly the membership the server just disagreed with.
+            let info = match client
+                .groups()
+                .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
+                .await
+            {
                 Ok(info) => info,
                 Err(e) => {
                     log::warn!(
@@ -3784,6 +3800,26 @@ mod tests {
 
         /// Feed the server's `<ack>` back through the read loop's own entry
         /// point. Returns whether a waiter claimed it.
+        /// The id of the first IQ sent from `from` onward carrying `xmlns`,
+        /// waiting for the frame to appear: the sender is a detached task, so
+        /// the frame is not on the wire when the caller reaches this point.
+        async fn next_iq_id_with_xmlns(&self, from: usize, xmlns: &str) -> Option<String> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                for index in from..self.transport.sent_count() {
+                    let node = crate::test_utils::decode_sent_iq(&self.transport, index).await;
+                    let node = node.get();
+                    if node.attrs().optional_string("xmlns").as_deref() == Some(xmlns) {
+                        return node.attrs().optional_string("id").map(|id| id.to_string());
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
         async fn deliver_ack(&self, message_id: &str, phash: Option<&str>) -> bool {
             let mut builder = NodeBuilder::new("ack")
                 .attr("id", message_id)
@@ -4716,6 +4752,83 @@ mod tests {
         })
         .await
         .expect("a disagreeing phash must drop the group snapshot that produced it");
+    }
+
+    /// The repair has to act on the membership the server returns, not on the
+    /// snapshot that produced the divergence. The task is scheduled after the
+    /// metadata invalidation and reads the list authoritatively, so a member the
+    /// warm snapshot never had is still asked about.
+    #[tokio::test]
+    async fn a_group_resync_asks_about_a_member_the_stale_snapshot_lacked() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("warm the stale snapshot").await;
+        let newcomer: Jid = "5511000000099@s.whatsapp.net".parse().unwrap();
+        let frames_before = fixture.transport.sent_count();
+
+        let client = Arc::clone(&fixture.client);
+        let group = fixture.group.clone();
+        let handler = tokio::spawn(async move {
+            client
+                .handle_phash_mismatch(&group, "2:a", "2:b", true, None)
+                .await
+        });
+
+        // The group query the task issues, answered with a participant list the
+        // warm snapshot does not contain.
+        let request_id = fixture
+            .next_iq_id_with_xmlns(frames_before, "w:g2")
+            .await
+            .expect("the repair must query the group before touching devices");
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", request_id.clone())
+            .attr("from", fixture.group.to_string())
+            .children([NodeBuilder::new("group")
+                .attr("id", fixture.group.to_string())
+                .attr("subject", "Test Group")
+                .children([
+                    NodeBuilder::new("participant")
+                        .attr("jid", fixture.member.to_string())
+                        .build(),
+                    NodeBuilder::new("participant")
+                        .attr("jid", newcomer.to_string())
+                        .build(),
+                ])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&fixture.client, &request_id, &response).await;
+
+        let usync_id = fixture
+            .next_iq_id_with_xmlns(frames_before, "usync")
+            .await
+            .expect("the refreshed membership must reach a device query");
+        let mut asked = Vec::new();
+        for index in frames_before..fixture.transport.sent_count() {
+            let node = crate::test_utils::decode_sent_iq(&fixture.transport, index).await;
+            let node = node.get();
+            if node.attrs().optional_string("id").as_deref() != Some(usync_id.as_str()) {
+                continue;
+            }
+            let Some(list) = node
+                .get_optional_child("usync")
+                .and_then(|usync| usync.get_optional_child("list"))
+            else {
+                continue;
+            };
+            for user in list.children().into_iter().flatten() {
+                if let Some(jid) = user.attrs().optional_jid("jid") {
+                    asked.push(jid);
+                }
+            }
+        }
+
+        assert!(
+            asked.iter().any(|jid| jid.user == newcomer.user),
+            "the device query must cover the member the server just returned: {asked:?}"
+        );
+        handler.await.expect("the handler completes");
     }
 
     /// The release side of the scopeguard. If it ever stops firing — a
