@@ -511,6 +511,11 @@ pub struct MemoryReport {
     /// finishes. A value that stays high outside a drain means refreshes are
     /// not completing, not that many users were seen.
     pub pending_device_sync: usize,
+    /// Groups with a participant-device resync in flight; normally zero. A
+    /// value that stays high means the resyncs are not completing, and every
+    /// group counted here is one whose next phash mismatch is deduplicated
+    /// away.
+    pub pending_group_device_resync: usize,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
     /// Addresses with a session establishment in flight; normally zero.
@@ -714,6 +719,10 @@ impl MemoryReport {
             ("inbound_commit_batch", self.inbound_commit_batch.entries),
             ("msg_secret_buffer", n(self.msg_secret_buffer)),
             ("pending_device_sync", n(self.pending_device_sync)),
+            (
+                "pending_group_device_resync",
+                n(self.pending_group_device_resync),
+            ),
             ("ensure_inflight", self.ensure_inflight),
             ("group_metadata_inflight", self.group_metadata_inflight),
             ("chat_lane_backlog", self.chat_lane_backlog),
@@ -879,6 +888,11 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  msg_secret_buffer:      {}", self.msg_secret_buffer)?;
         writeln!(f, "  pending_device_sync:    {}", self.pending_device_sync)?;
+        writeln!(
+            f,
+            "  group_device_resync:    {}",
+            self.pending_group_device_resync
+        )?;
         #[cfg(feature = "plugins")]
         {
             writeln!(f, "--- Plugins ---")?;

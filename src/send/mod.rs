@@ -307,6 +307,31 @@ fn sort_session_lock_keys(keys: &mut Vec<Jid>) {
     keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
 }
 
+/// The identities a device query for this group's members must ask about.
+///
+/// A LID-addressed group is resolved through the members' phone JIDs wherever
+/// the group knows the mapping: device-list usync is unreliable for LIDs, so
+/// asking under the LID leaves members unresolved and their devices
+/// undiscovered. Shared by the send path's target resolution and by the phash
+/// repair, which would otherwise ask about different identities than the send
+/// it is repairing.
+fn group_device_query_jids(group_info: &wacore::client::context::GroupInfo) -> Vec<Jid> {
+    let is_lid_mode = group_info.addressing_mode == AddressingMode::Lid;
+    group_info
+        .participants
+        .iter()
+        .map(|jid| {
+            if is_lid_mode
+                && jid.is_lid()
+                && let Some(pn) = group_info.phone_jid_for_lid_user(&jid.user)
+            {
+                return pn.to_non_ad();
+            }
+            jid.to_non_ad()
+        })
+        .collect()
+}
+
 /// True when every SKDM target belongs to our own account (PN or LID user).
 /// Own devices are never memoized warm (WA Web's `!isMeDevice` guard on
 /// `markHasSenderKey`), so an own-only `needs` set is the permanent
@@ -1590,19 +1615,7 @@ impl Client {
         };
 
         let is_lid_mode = group_info.addressing_mode == AddressingMode::Lid;
-        let jids_to_resolve: Vec<Jid> = group_info
-            .participants
-            .iter()
-            .map(|jid| {
-                if is_lid_mode
-                    && jid.is_lid()
-                    && let Some(pn) = group_info.phone_jid_for_lid_user(&jid.user)
-                {
-                    return pn.to_non_ad();
-                }
-                jid.to_non_ad()
-            })
-            .collect();
+        let jids_to_resolve = group_device_query_jids(group_info);
 
         let resolved = match freshness {
             crate::cache::Freshness::CachePreferred => {
@@ -1950,13 +1963,21 @@ impl Client {
                     return;
                 }
             };
-            if info.participants.is_empty() {
+            let targets = group_device_query_jids(&info);
+            if targets.is_empty() {
                 return;
             }
-            if let Err(e) = client
-                .refresh_user_devices(info.participants.to_vec())
-                .await
-            {
+            // Invalidate-then-resolve, the pair `schedule_unknown_device_sync`
+            // uses for a contact, rather than the authoritative refresh: that
+            // one demands a complete response, so a single member the server
+            // will not resolve — a number that left WhatsApp, a stale row —
+            // fails the repair for the whole group. Here every list the server
+            // does return is committed, which is what the member with the new
+            // device needs.
+            for target in &targets {
+                client.invalidate_device_cache(&target.user).await;
+            }
+            if let Err(e) = client.get_user_devices_owned(targets).await {
                 log::warn!(
                     "phash mismatch for {}: participant device resync failed: {e:?}",
                     group.observe()
@@ -4695,6 +4716,57 @@ mod tests {
         })
         .await
         .expect("a disagreeing phash must drop the group snapshot that produced it");
+    }
+
+    /// The release side of the scopeguard. If it ever stops firing — a
+    /// refactor drops the guard, an edit returns before it is built — every
+    /// later mismatch for that group is deduplicated away forever, and the
+    /// dedup test above still passes because it seeds the mark by hand. The
+    /// guard runs on drop, so the outcome the task reaches does not change
+    /// whether it fires: this client has no socket, the participant query
+    /// fails at once, and the mark still has to clear.
+    #[tokio::test]
+    async fn a_finished_group_resync_releases_its_mark() {
+        let client = crate::test_utils::create_test_client().await;
+        let group: Jid = "120363000000000003@g.us".parse().unwrap();
+
+        client.resync_group_participant_devices(&group).await;
+
+        crate::test_utils::poll_until("the resync to release its mark", || {
+            client.pending_group_device_resync.add(&group)
+        })
+        .await;
+    }
+
+    /// A LID group's device query goes out under the members' phone JIDs: usync
+    /// is unreliable for LIDs, so asking under the LID leaves the member
+    /// unresolved and the device that caused the mismatch undiscovered. The
+    /// send path resolves this way already; the repair reads the same helper so
+    /// the two cannot ask about different identities.
+    #[test]
+    fn a_lid_group_is_queried_by_the_members_phone_jids() {
+        use std::collections::HashMap;
+        use wacore::client::context::GroupInfo;
+
+        let lid: Jid = "20000000000010@lid".parse().unwrap();
+        let pn: Jid = "5511000000010@s.whatsapp.net".parse().unwrap();
+        let unmapped: Jid = "20000000000011@lid".parse().unwrap();
+        let mut map = HashMap::new();
+        map.insert(lid.user.clone(), pn.clone());
+
+        let info = GroupInfo::with_lid_to_pn_map(
+            vec![lid.clone(), unmapped.clone()],
+            AddressingMode::Lid,
+            map,
+        );
+
+        let asked = group_device_query_jids(&info);
+        assert_eq!(
+            asked,
+            vec![pn, unmapped],
+            "a mapped LID is asked about by its phone JID; one the group cannot map \
+             is left as it is, which is what the send path does"
+        );
     }
 
     /// The other half, and the reason the repair cannot storm: the members that
