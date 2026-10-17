@@ -22960,3 +22960,35 @@ async fn decrypt_failure_admission_registers_once() {
     assert!(client.set_decrypt_failure_admission(policy()));
     assert!(!client.set_decrypt_failure_admission(policy()));
 }
+
+/// The policy is consulted only while the per-message cap still allows a
+/// retry: capped redeliveries go straight to the PDO fallback without
+/// spending admission budget.
+#[tokio::test]
+async fn decrypt_failure_admission_not_consulted_past_cap() {
+    let (client, _transport) = capturing_client("dfa_cap").await;
+    let policy = Arc::new(FixedDecryptFailureAdmission {
+        verdict: false,
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    assert!(client.set_decrypt_failure_admission(policy.clone()));
+    let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+    let info = Arc::new(MessageInfo {
+        id: "DFACAP".into(),
+        source: crate::types::message::MessageSource {
+            sender: sender.clone(),
+            chat: sender,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    for _ in 0..(MAX_DECRYPT_RETRIES + 2) {
+        client
+            .run_retry_receipt(&info, RetryReason::BadMac, DecryptFailMode::Show)
+            .await;
+    }
+    assert_eq!(
+        policy.calls.lock().expect("calls lock").len(),
+        usize::from(MAX_DECRYPT_RETRIES)
+    );
+}

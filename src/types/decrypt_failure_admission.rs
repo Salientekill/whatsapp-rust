@@ -19,14 +19,16 @@ use wacore_binary::Jid;
 /// stanza is still transport-acked, so the server stops redelivering it. The
 /// `UndecryptableMessage` event is dispatched either way. A dropped message is
 /// not requested again, so a policy should refill over time to keep genuine
-/// recovery possible.
+/// recovery possible. A refused first attempt still sends the one-shot PDO
+/// request to our primary phone, as the default path does.
 ///
 /// [`admit`](DecryptFailureAdmission::admit) runs inline on the receive path:
 /// it must be a fast, local decision with no I/O or blocking.
 ///
 /// Scope: consulted only on the automatic decrypt-failure path, for messages
-/// from other accounts. Our own devices' messages (`is_from_me`) and explicit
-/// retry requests never reach the policy.
+/// from other accounts, after the per-message cap: redeliveries already past
+/// `MAX_DECRYPT_RETRIES` never reach the policy. Our own devices' messages
+/// (`is_from_me`) and explicit retry requests are never consulted either.
 pub trait DecryptFailureAdmission: wacore::sync_marker::MaybeSendSync {
     /// Return `true` to send the retry receipt (default behavior), `false` to
     /// ack the stanza without one.
