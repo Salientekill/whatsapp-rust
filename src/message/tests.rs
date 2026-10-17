@@ -22822,3 +22822,141 @@ fn session_store_encoding_does_not_rebuild_skipped_key_arrays() {
         "store encoding allocated a {max}-byte temporary"
     );
 }
+
+struct FixedDecryptFailureAdmission {
+    verdict: bool,
+    calls: std::sync::Mutex<Vec<(Jid, Jid)>>,
+}
+
+impl crate::DecryptFailureAdmission for FixedDecryptFailureAdmission {
+    fn admit(&self, chat: &Jid, sender: &Jid) -> bool {
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push((chat.clone(), sender.clone()));
+        self.verdict
+    }
+}
+
+struct DecryptFailureOutcome {
+    retry_sent: bool,
+    ack_sent: bool,
+    undecryptable_events: usize,
+    policy_calls: Vec<(Jid, Jid)>,
+}
+
+/// Runs one decrypt failure with an optional fixed-verdict policy and reports
+/// what reached the wire once the transport ack (always sent here) is out.
+async fn run_decrypt_failure_with_policy(
+    test_id: &str,
+    verdict: Option<bool>,
+    is_from_me: bool,
+) -> DecryptFailureOutcome {
+    let (client, transport) = capturing_client(test_id).await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.subscribe_handler(recorder.clone()).detach();
+    let policy = verdict.map(|verdict| {
+        let policy = Arc::new(FixedDecryptFailureAdmission {
+            verdict,
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        assert!(client.set_decrypt_failure_admission(policy.clone()));
+        policy
+    });
+
+    let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+    let info = Arc::new(MessageInfo {
+        id: format!("DFA{test_id}").into(),
+        source: crate::types::message::MessageSource {
+            sender: sender.clone(),
+            chat: sender.clone(),
+            is_from_me,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    // BadMac so the retry receipt carries no keys (no device account needed).
+    client
+        .handle_decrypt_failure(&info, RetryReason::BadMac, DecryptFailMode::Show)
+        .await;
+
+    let retry_sent = |frames: &[bytes::Bytes]| {
+        frames.iter().enumerate().any(|(i, frame)| {
+            decode_frame(i, frame).is_some_and(|buf| {
+                wacore_binary::marshal::unmarshal_packed_ref(&buf).is_ok_and(|node| {
+                    node.tag.as_ref() == "receipt"
+                        && node.get_attr("type").is_some_and(|v| v.as_str() == "retry")
+                })
+            })
+        })
+    };
+    let mut ack_sent = false;
+    for _ in 0..80 {
+        if find_message_ack(&transport.sent()).is_some() {
+            ack_sent = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    DecryptFailureOutcome {
+        retry_sent: retry_sent(&transport.sent()),
+        ack_sent,
+        undecryptable_events: recorder.undecryptable().len(),
+        policy_calls: policy
+            .map(|p| p.calls.lock().expect("calls lock").clone())
+            .unwrap_or_default(),
+    }
+}
+
+#[tokio::test]
+async fn decrypt_failure_without_admission_policy_sends_retry_and_ack() {
+    let out = run_decrypt_failure_with_policy("dfa_none", None, false).await;
+    assert!(out.retry_sent, "default path must request a retry");
+    assert!(out.ack_sent);
+    assert_eq!(out.undecryptable_events, 1);
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_refusal_acks_without_retry() {
+    let out = run_decrypt_failure_with_policy("dfa_refuse", Some(false), false).await;
+    assert!(
+        out.ack_sent,
+        "a refused retry must still ack so the server stops redelivering"
+    );
+    assert!(!out.retry_sent, "a refused retry must not reach the wire");
+    assert_eq!(out.undecryptable_events, 1, "the event still dispatches");
+    let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+    assert_eq!(out.policy_calls, vec![(sender.clone(), sender)]);
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_accept_keeps_default_path() {
+    let out = run_decrypt_failure_with_policy("dfa_accept", Some(true), false).await;
+    assert!(out.retry_sent);
+    assert!(out.ack_sent);
+    assert_eq!(out.undecryptable_events, 1);
+    assert_eq!(out.policy_calls.len(), 1);
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_skips_own_messages() {
+    let out = run_decrypt_failure_with_policy("dfa_own", Some(false), true).await;
+    assert!(
+        out.policy_calls.is_empty(),
+        "own messages never reach the policy"
+    );
+    assert!(out.retry_sent);
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_registers_once() {
+    let (client, _transport) = capturing_client("dfa_once").await;
+    let policy = || {
+        Arc::new(FixedDecryptFailureAdmission {
+            verdict: true,
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+    };
+    assert!(client.set_decrypt_failure_admission(policy()));
+    assert!(!client.set_decrypt_failure_admission(policy()));
+}

@@ -2137,6 +2137,13 @@ pub struct Client {
     pub(crate) retry_admission:
         std::sync::OnceLock<Arc<dyn crate::types::retry_admission::RetryAdmission>>,
 
+    /// Optional outbound retry-receipt admission policy (see
+    /// [`crate::types::decrypt_failure_admission::DecryptFailureAdmission`]).
+    /// `None` (default) requests a retry for every decrypt failure.
+    pub(crate) decrypt_failure_admission: std::sync::OnceLock<
+        Arc<dyn crate::types::decrypt_failure_admission::DecryptFailureAdmission>,
+    >,
+
     /// Optional run-loop dial admission policy, fixed during assembly.
     pub(crate) connect_admission:
         Option<Arc<dyn crate::types::connect_admission::ConnectAdmission>>,
