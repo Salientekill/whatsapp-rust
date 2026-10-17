@@ -230,6 +230,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         reason: RetryReason,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
+        ack_recipient: Option<&Jid>,
     ) -> bool {
         self.dispatch_undecryptable_event(
             Arc::clone(info),
@@ -240,6 +241,7 @@ impl Client {
         .await;
         let client = Arc::clone(self);
         let info = Arc::clone(info);
+        let ack_recipient = ack_recipient.cloned();
         self.outbound_flush.spawn(&*self.runtime, async move {
             // A self-fanout is our own message; retrying it to ourselves is
             // futile and the server's offline queue ignores a bare transport
@@ -261,7 +263,9 @@ impl Client {
                 .run_retry_receipt(&info, reason, decrypt_fail_mode)
                 .await;
             if resend_sent {
-                client.send_transport_ack(&info).await;
+                client
+                    .send_transport_ack(&info, ack_recipient.as_ref())
+                    .await;
             }
         });
         true

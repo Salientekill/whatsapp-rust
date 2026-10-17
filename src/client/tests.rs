@@ -3075,7 +3075,7 @@ fn test_message_ack_source_node_own_device_addressing() {
         .parse()
         .expect("own device PN JID should parse");
 
-    let source = message_ack_source_node(&info);
+    let source = message_ack_source_node(&info, None);
     let built = build_ack_node(&source.as_node_ref(), Some(&own_device_pn))
         .expect("message ack should be buildable");
 
@@ -3119,7 +3119,7 @@ fn test_message_ack_source_node_incoming_dm_addressing() {
         .parse()
         .expect("own device PN JID should parse");
 
-    let source = message_ack_source_node(&info);
+    let source = message_ack_source_node(&info, None);
     let built = build_ack_node(&source.as_node_ref(), Some(&own_device_pn))
         .expect("dm ack should be buildable");
 
@@ -3153,7 +3153,7 @@ fn test_message_ack_source_node_status_addressing() {
         .parse()
         .expect("own device PN JID should parse");
 
-    let source = message_ack_source_node(&info);
+    let source = message_ack_source_node(&info, None);
     let built = build_ack_node(&source.as_node_ref(), Some(&own_device_pn))
         .expect("status ack should be buildable");
 
@@ -3192,7 +3192,7 @@ fn test_message_ack_source_node_group_addressing() {
         .parse()
         .expect("own device PN JID should parse");
 
-    let source = message_ack_source_node(&info);
+    let source = message_ack_source_node(&info, None);
     let built = build_ack_node(&source.as_node_ref(), Some(&own_device_pn))
         .expect("group message ack should be buildable");
 
