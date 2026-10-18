@@ -432,6 +432,7 @@ impl Client {
         // Ok so the caller still acks and the server stops redelivering.
         if automatic
             && !info.source.is_from_me
+            && !crate::retry::retry_receipt_always_suppressed(info)
             && let Some(policy) = self.decrypt_failure_admission.get()
             && !policy.admit(&info.source.chat, &info.source.sender)
         {

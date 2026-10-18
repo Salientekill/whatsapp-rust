@@ -23101,3 +23101,51 @@ async fn decrypt_failure_refused_ack_preserves_stanza_recipient() {
         Some("156535032389744@lid")
     );
 }
+
+/// A bot reply in a non-bot group never gets a retry receipt, so it must not
+/// spend admission budget; a bot DM still retries and is still consulted.
+#[tokio::test]
+async fn decrypt_failure_admission_skips_suppressed_bot_retries() {
+    use crate::types::events::DecryptFailMode;
+    let (client, _transport) = capturing_client("dfa_bot").await;
+    let policy = Arc::new(FixedDecryptFailureAdmission {
+        verdict: true,
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    assert!(client.set_decrypt_failure_admission(policy.clone()));
+    let bot: Jid = "200000000000002@bot".parse().expect("bot");
+    let group_bot = Arc::new(MessageInfo {
+        id: "DFABOTGRP".into(),
+        source: crate::types::message::MessageSource {
+            chat: "120363021033254949@g.us".parse().expect("group"),
+            sender: bot.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .run_retry_receipt(&group_bot, RetryReason::BadMac, DecryptFailMode::Show)
+        .await;
+    assert!(
+        policy.calls.lock().expect("calls lock").is_empty(),
+        "a suppressed bot retry must not reach the policy"
+    );
+
+    let bot_dm = Arc::new(MessageInfo {
+        id: "DFABOTDM".into(),
+        source: crate::types::message::MessageSource {
+            chat: bot.clone(),
+            sender: bot.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .run_retry_receipt(&bot_dm, RetryReason::BadMac, DecryptFailMode::Show)
+        .await;
+    assert_eq!(
+        *policy.calls.lock().expect("calls lock"),
+        vec![(bot.clone(), bot)]
+    );
+}
