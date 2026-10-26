@@ -2831,16 +2831,17 @@ impl Drop for Connection<'_> {
 #[cfg(test)]
 mod admission_tests;
 
-/// Every message in the error's source chain, nearest first, without repeats.
+/// Every message in the error's source chain, nearest first. A message already
+/// contained in the previous one is a repeat and is skipped; one that extends it
+/// carries extra detail and replaces it.
 fn connect_chain(e: &ConnectError) -> String {
     use crate::error::ErrorChainExt;
     let mut out: Vec<String> = Vec::new();
     for m in e.sources().map(|c| c.to_string()) {
-        if out
-            .last()
-            .is_none_or(|l| !l.contains(&m) && !m.contains(l.as_str()))
-        {
-            out.push(m);
+        match out.last_mut() {
+            Some(l) if l.contains(m.as_str()) => {}
+            Some(l) if m.contains(l.as_str()) => *l = m,
+            _ => out.push(m),
         }
     }
     out.join(": ")
@@ -2854,16 +2855,35 @@ mod tests {
     #[test]
     fn connect_chain_includes_the_source_behind_the_top_message() {
         let e = ConnectError::Version(anyhow::anyhow!("dns failure").context("fetching sw.js"));
-        let chain = connect_chain(&e);
-        assert!(
-            chain.starts_with("failed to resolve app version"),
-            "{chain}"
-        );
-        assert!(
-            chain.contains("fetching sw.js") && chain.contains("dns failure"),
-            "{chain}"
+        assert_eq!(
+            connect_chain(&e),
+            "failed to resolve app version: fetching sw.js: dns failure"
         );
         assert_eq!(connect_chain(&ConnectError::Paused), "client is paused");
+    }
+
+    #[test]
+    fn connect_chain_keeps_a_cause_that_extends_its_wrapper() {
+        // The cause adds text to the wrapper's message: it must survive.
+        let e = ConnectError::Version(
+            anyhow::anyhow!("proxy connect failed: connection refused")
+                .context("proxy connect failed"),
+        );
+        assert_eq!(
+            connect_chain(&e),
+            "failed to resolve app version: proxy connect failed: connection refused"
+        );
+    }
+
+    #[test]
+    fn connect_chain_skips_a_cause_the_wrapper_already_prints() {
+        let e = ConnectError::Version(
+            anyhow::anyhow!("dns failure").context("lookup failed: dns failure"),
+        );
+        assert_eq!(
+            connect_chain(&e),
+            "failed to resolve app version: lookup failed: dns failure"
+        );
     }
 
     /// Install a socket over `transport` on `client` as a published connection,
